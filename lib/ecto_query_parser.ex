@@ -77,7 +77,7 @@ defmodule EctoQueryParser do
   end
 
   defp extract_schema(module) when is_atom(module) do
-    if function_exported?(module, :__schema__, 1), do: module, else: nil
+    Code.ensure_loaded?(module) and function_exported?(module, :__schema__, 1) and module || nil
   end
 
   defp extract_schema(%Ecto.Query{from: %{source: {_, schema}}}) when is_atom(schema) and not is_nil(schema) do

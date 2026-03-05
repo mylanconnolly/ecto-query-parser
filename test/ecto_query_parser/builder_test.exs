@@ -3,41 +3,7 @@ defmodule EctoQueryParser.BuilderTest do
 
   import Ecto.Query
 
-  defmodule Company do
-    use Ecto.Schema
-
-    schema "companies" do
-      field :company_name, :string
-    end
-  end
-
-  defmodule Author do
-    use Ecto.Schema
-
-    schema "authors" do
-      field :name, :string
-      field :email, :string
-      belongs_to :company, Company
-      has_many :posts, EctoQueryParser.BuilderTest.TestSchema
-    end
-  end
-
-  defmodule TestSchema do
-    use Ecto.Schema
-
-    schema "test_items" do
-      field :name, :string
-      field :age, :integer
-      field :score, :float
-      field :active, :boolean
-      field :tags, {:array, :string}
-      field :body, :string
-      field :role, :string
-      field :status, :string
-      field :metadata, :map
-      belongs_to :author, Author
-    end
-  end
+  alias EctoQueryParser.Test.TestSchema
 
   defp build(query_string, opts \\ []) do
     EctoQueryParser.apply(TestSchema, query_string, opts)

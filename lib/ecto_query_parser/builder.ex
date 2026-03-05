@@ -302,10 +302,10 @@ defmodule EctoQueryParser.Builder do
     do: {:ok, dynamic([row], fragment("RIGHT(?, ?)", ^a, ^b))}
 
   defp build_fragment("ADD_INTERVAL", [a, b]),
-    do: {:ok, dynamic([row], fragment("? + ?::interval", ^a, ^b))}
+    do: {:ok, dynamic([row], fragment("? + ?::interval", ^a, type(^b, :string)))}
 
   defp build_fragment("SUB_INTERVAL", [a, b]),
-    do: {:ok, dynamic([row], fragment("? - ?::interval", ^a, ^b))}
+    do: {:ok, dynamic([row], fragment("? - ?::interval", ^a, type(^b, :string)))}
 
   # 3-arg functions
   defp build_fragment("SUBSTRING", [a, b, c]),
