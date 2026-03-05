@@ -215,7 +215,8 @@ defmodule EctoQueryParser.Integration.QueryExecutionTest do
     end
 
     test "complex nested grouping" do
-      assert run(~s{(name == "alice" AND age >= 18) OR (role == "admin" AND active == true)}) == []
+      assert run(~s{(name == "alice" AND age >= 18) OR (role == "admin" AND active == true)}) ==
+               []
     end
   end
 

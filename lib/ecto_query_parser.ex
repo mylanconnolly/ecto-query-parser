@@ -77,10 +77,11 @@ defmodule EctoQueryParser do
   end
 
   defp extract_schema(module) when is_atom(module) do
-    Code.ensure_loaded?(module) and function_exported?(module, :__schema__, 1) and module || nil
+    (Code.ensure_loaded?(module) and function_exported?(module, :__schema__, 1) and module) || nil
   end
 
-  defp extract_schema(%Ecto.Query{from: %{source: {_, schema}}}) when is_atom(schema) and not is_nil(schema) do
+  defp extract_schema(%Ecto.Query{from: %{source: {_, schema}}})
+       when is_atom(schema) and not is_nil(schema) do
     schema
   end
 
@@ -104,7 +105,13 @@ defmodule EctoQueryParser do
   end
 
   # Schemaless joins: pattern match on :table key
-  defp apply_single_join(query, %{binding: binding, table: table, owner_key: ok, related_key: rk, parent: :root}) do
+  defp apply_single_join(query, %{
+         binding: binding,
+         table: table,
+         owner_key: ok,
+         related_key: rk,
+         parent: :root
+       }) do
     from(row in query,
       left_join: related in ^table,
       on: field(related, ^rk) == field(row, ^ok),
@@ -112,7 +119,13 @@ defmodule EctoQueryParser do
     )
   end
 
-  defp apply_single_join(query, %{binding: binding, table: table, owner_key: ok, related_key: rk, parent: parent}) do
+  defp apply_single_join(query, %{
+         binding: binding,
+         table: table,
+         owner_key: ok,
+         related_key: rk,
+         parent: parent
+       }) do
     from([{^parent, p}] in query,
       left_join: related in ^table,
       on: field(related, ^rk) == field(p, ^ok),

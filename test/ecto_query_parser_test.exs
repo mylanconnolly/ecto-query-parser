@@ -261,8 +261,7 @@ defmodule EctoQueryParserTest do
     test "parses function with multiple arguments" do
       assert EctoQueryParser.parse(~s{concat("hello", " ", "world")}) ==
                {:ok,
-                {:function, "concat",
-                 [{:string, "hello"}, {:string, " "}, {:string, "world"}]}}
+                {:function, "concat", [{:string, "hello"}, {:string, " "}, {:string, "world"}]}}
     end
 
     test "parses function with mixed argument types" do
@@ -279,16 +278,12 @@ defmodule EctoQueryParserTest do
 
     test "parses nested function calls" do
       assert EctoQueryParser.parse(~s{TO_UPPER(TRIM("  foo  "))}) ==
-               {:ok,
-                {:function, "to_upper",
-                 [{:function, "trim", [{:string, "  foo  "}]}]}}
+               {:ok, {:function, "to_upper", [{:function, "trim", [{:string, "  foo  "}]}]}}
     end
 
     test "parses deeply nested function calls" do
       assert EctoQueryParser.parse(~s{a(b(c("x")))}) ==
-               {:ok,
-                {:function, "a",
-                 [{:function, "b", [{:function, "c", [{:string, "x"}]}]}]}}
+               {:ok, {:function, "a", [{:function, "b", [{:function, "c", [{:string, "x"}]}]}]}}
     end
 
     test "parses function with whitespace around parens" do
@@ -352,8 +347,7 @@ defmodule EctoQueryParserTest do
     test "function on right side" do
       assert EctoQueryParser.parse(~s{name == TO_LOWER("FOO")}) ==
                {:ok,
-                {:op, :==, {:identifier, "name"},
-                 {:function, "to_lower", [{:string, "FOO"}]}}}
+                {:op, :==, {:identifier, "name"}, {:function, "to_lower", [{:string, "FOO"}]}}}
     end
 
     test "dotted identifier" do
@@ -516,8 +510,7 @@ defmodule EctoQueryParserTest do
 
       assert EctoQueryParser.parse(input) ==
                {:ok,
-                {:op, :==,
-                 {:function, "to_upper", [{:identifier, "name"}]},
+                {:op, :==, {:function, "to_upper", [{:identifier, "name"}]},
                  {:function, "to_upper", [{:string, "foo"}]}}}
     end
 

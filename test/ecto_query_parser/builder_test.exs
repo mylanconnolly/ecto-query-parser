@@ -441,7 +441,9 @@ defmodule EctoQueryParser.BuilderTest do
 
     test "simple field access without schema" do
       assert {:ok, query} =
-               schemaless_build(~s{name == "alice"}, allowed_fields: [name: :string, age: :integer])
+               schemaless_build(~s{name == "alice"},
+                 allowed_fields: [name: :string, age: :integer]
+               )
 
       assert %Ecto.Query{} = query
       assert query.joins == []

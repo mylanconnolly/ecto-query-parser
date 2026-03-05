@@ -334,8 +334,7 @@ defmodule EctoQueryParser.Builder do
     do: {:ok, dynamic([row], fragment("CONCAT(?, ?, ?, ?, ?, ?)", ^a, ^b, ^c, ^d, ^e, ^f))}
 
   defp build_fragment("CONCAT", [a, b, c, d, e, f, g]),
-    do:
-      {:ok, dynamic([row], fragment("CONCAT(?, ?, ?, ?, ?, ?, ?)", ^a, ^b, ^c, ^d, ^e, ^f, ^g))}
+    do: {:ok, dynamic([row], fragment("CONCAT(?, ?, ?, ?, ?, ?, ?)", ^a, ^b, ^c, ^d, ^e, ^f, ^g))}
 
   defp build_fragment("CONCAT", [a, b, c, d, e, f, g, h]),
     do:
