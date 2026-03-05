@@ -16,7 +16,8 @@ defmodule EctoQueryParser.MixProject do
       package: package(),
       docs: docs(),
       name: "EctoQueryParser",
-      description: "A query language parser that converts human-readable filter strings into Ecto WHERE clauses.",
+      description:
+        "A query language parser that converts human-readable filter strings into Ecto WHERE clauses.",
       source_url: @source_url,
       homepage_url: @source_url,
       usage_rules: usage_rules()
