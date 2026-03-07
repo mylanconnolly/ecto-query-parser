@@ -1,5 +1,5 @@
 {
-  description = "AutoForge – Phoenix/Ash AI coding environment";
+  description = "Ecto Query Parser development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
