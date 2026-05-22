@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.1
+
+### Fixed
+
+- `many_to_many` filters with `:join_prefix` crashed with
+  `FunctionClauseError` in `Ecto.Queryable.Tuple.to_query/1`. The EXISTS
+  subquery built the inner-join source as a `{prefix, table}` string tuple
+  and pinned it into the join macro; at runtime that falls through
+  `Ecto.Queryable.to_query/1` which only accepts `{string, atom}` tuples.
+  The prefix is now passed via `join/5`'s `:prefix` keyword option, the
+  same pattern used for prefixed belongs-to joins.
+
 ## v0.3.0
 
 ### Added
