@@ -12,6 +12,7 @@ defmodule EctoQueryParser.Test.Author do
   schema "authors" do
     field :name, :string
     field :email, :string
+    field :hired_on, :date
     belongs_to :company, EctoQueryParser.Test.Company
     has_many :posts, EctoQueryParser.Test.TestSchema
   end
@@ -31,6 +32,8 @@ defmodule EctoQueryParser.Test.TestSchema do
     field :status, :string
     field :metadata, :map
     field :created_at, :utc_datetime
+    field :performed_on, :date
+    field :balance, :decimal
     belongs_to :author, EctoQueryParser.Test.Author
   end
 end

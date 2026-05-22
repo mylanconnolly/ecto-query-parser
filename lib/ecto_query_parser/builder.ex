@@ -84,29 +84,25 @@ defmodule EctoQueryParser.Builder do
 
   # Comparison operators
   defp to_dynamic({:op, :==, left, right}, opts) do
-    with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
       {:ok, dynamic([row], ^l == ^r), lj ++ rj}
     end
   end
 
   defp to_dynamic({:op, :!=, left, right}, opts) do
-    with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
       {:ok, dynamic([row], ^l != ^r), lj ++ rj}
     end
   end
 
   defp to_dynamic({:op, :>=, left, right}, opts) do
-    with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
       {:ok, dynamic([row], ^l >= ^r), lj ++ rj}
     end
   end
 
   defp to_dynamic({:op, :<=, left, right}, opts) do
-    with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
       {:ok, dynamic([row], ^l <= ^r), lj ++ rj}
     end
   end
@@ -147,8 +143,14 @@ defmodule EctoQueryParser.Builder do
 
   # includes: value in array field
   defp to_dynamic({:op, :includes, left, right}, opts) do
+    element_type =
+      case field_type(left, opts) do
+        {:array, inner} -> inner
+        _ -> nil
+      end
+
     with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+         {:ok, r, rj} <- to_expr_coerced(right, element_type, opts) do
       {:ok, dynamic([row], ^r in ^l), lj ++ rj}
     end
   end
@@ -494,5 +496,193 @@ defmodule EctoQueryParser.Builder do
       nil -> {:ok, json_expr, []}
       type -> {:ok, dynamic([row], type(^json_expr, ^type)), []}
     end
+  end
+
+  # --- Type coercion of literal operands ---
+
+  # Resolves both operands of a comparison, applying type coercion when one
+  # side is a literal and the other identifies a typed field.
+  defp build_comparison_operands(left, right, opts) do
+    left_type = field_type(left, opts)
+    right_type = field_type(right, opts)
+
+    with {:ok, l, lj} <- to_expr_coerced(left, right_type, opts),
+         {:ok, r, rj} <- to_expr_coerced(right, left_type, opts) do
+      {:ok, l, lj, r, rj}
+    end
+  end
+
+  # When a literal sits opposite a typed field in a comparison, wrap it with
+  # `type/2` so Ecto and the DB driver cast it to the column's type rather than
+  # sending it as a bare text/integer parameter.
+  defp to_expr_coerced(ast, target_type, opts) do
+    case coercion_type(ast, target_type) do
+      nil ->
+        to_expr(ast, opts)
+
+      cast_type ->
+        case literal_value(ast) do
+          {:ok, value} -> {:ok, dynamic([row], type(^value, ^cast_type)), []}
+          :error -> to_expr(ast, opts)
+        end
+    end
+  end
+
+  # Return the type to coerce to, or nil if no coercion should happen.
+  # Skip coercion when the literal's natural type already matches the target.
+  defp coercion_type(_ast, nil), do: nil
+  defp coercion_type({:string, _}, :string), do: nil
+  defp coercion_type({:integer, _}, :integer), do: nil
+  defp coercion_type({:integer, _}, :id), do: nil
+  defp coercion_type({:float, _}, :float), do: nil
+  defp coercion_type({:boolean, _}, :boolean), do: nil
+  defp coercion_type({:string, _}, type), do: type
+  defp coercion_type({:integer, _}, type), do: type
+  defp coercion_type({:float, _}, type), do: type
+  defp coercion_type({:boolean, _}, type), do: type
+
+  defp coercion_type({:list, _}, {:array, inner})
+       when not is_nil(inner) and inner != :string,
+       do: {:array, inner}
+
+  defp coercion_type(_, _), do: nil
+
+  defp literal_value({:string, v}), do: {:ok, v}
+  defp literal_value({:integer, v}), do: {:ok, v}
+  defp literal_value({:float, v}), do: {:ok, v}
+  defp literal_value({:boolean, v}), do: {:ok, v}
+
+  defp literal_value({:list, items}) do
+    values =
+      Enum.map(items, fn
+        {:string, v} -> v
+        {:integer, v} -> v
+        {:float, v} -> v
+        {:boolean, v} -> v
+      end)
+
+    {:ok, values}
+  end
+
+  defp literal_value(_), do: :error
+
+  # --- Field type resolution ---
+
+  # Returns the Ecto type of the field referenced by an identifier AST node,
+  # or nil if the AST is not an identifier, the field is unknown, or no type
+  # information is available.
+  defp field_type({:identifier, name}, opts) do
+    if String.contains?(name, ".") do
+      dotted_field_type(name, opts)
+    else
+      simple_field_type(name, opts)
+    end
+  end
+
+  defp field_type(_, _), do: nil
+
+  defp simple_field_type(name, opts) do
+    case existing_atom(name) do
+      {:ok, atom} ->
+        case get_field_type(atom, opts) do
+          nil -> schema_field_type(atom, opts)
+          type -> type
+        end
+
+      :error ->
+        nil
+    end
+  end
+
+  defp schema_field_type(atom, opts) do
+    case Keyword.fetch(opts, :schema) do
+      {:ok, schema} -> schema.__schema__(:type, atom)
+      :error -> nil
+    end
+  end
+
+  defp dotted_field_type(name, opts) do
+    first_segment_str = name |> String.split(".", parts: 2) |> hd()
+
+    case existing_atom(first_segment_str) do
+      {:ok, first_segment} ->
+        case Keyword.fetch(opts, :schema) do
+          {:ok, schema} ->
+            if is_json_field?(schema, first_segment) do
+              json_path_field_type(name, opts)
+            else
+              schema_assoc_field_type(name, schema)
+            end
+
+          :error ->
+            case get_field_type(first_segment, opts) do
+              :map -> json_path_field_type(name, opts)
+              {:assoc, _} -> allowed_assoc_field_type(name, opts)
+              _ -> nil
+            end
+        end
+
+      :error ->
+        nil
+    end
+  end
+
+  defp json_path_field_type(name, opts) do
+    case existing_atom(name) do
+      {:ok, atom} -> get_field_type(atom, opts)
+      :error -> nil
+    end
+  end
+
+  defp schema_assoc_field_type(name, schema) do
+    segments = String.split(name, ".")
+    assoc_segments = Enum.slice(segments, 0..-2//1)
+    field_str = List.last(segments)
+
+    with {:ok, field_atom} <- existing_atom(field_str),
+         {:ok, leaf_schema} <- walk_schema_assocs(assoc_segments, schema) do
+      leaf_schema.__schema__(:type, field_atom)
+    else
+      _ -> nil
+    end
+  end
+
+  defp walk_schema_assocs([], schema), do: {:ok, schema}
+
+  defp walk_schema_assocs([segment | rest], schema) do
+    with {:ok, assoc_atom} <- existing_atom(segment),
+         assoc when not is_nil(assoc) <- schema.__schema__(:association, assoc_atom) do
+      walk_schema_assocs(rest, assoc.queryable)
+    else
+      _ -> :error
+    end
+  end
+
+  defp allowed_assoc_field_type(name, opts) do
+    allowed = Keyword.get(opts, :allowed_fields, [])
+    walk_allowed_assocs(String.split(name, "."), allowed)
+  end
+
+  defp walk_allowed_assocs([last], fields) do
+    case existing_atom(last) do
+      {:ok, atom} -> Keyword.get(fields, atom)
+      :error -> nil
+    end
+  end
+
+  defp walk_allowed_assocs([head | rest], fields) do
+    with {:ok, atom} <- existing_atom(head),
+         {:assoc, assoc_opts} <- Keyword.get(fields, atom) do
+      sub_fields = Keyword.get(assoc_opts, :fields, [])
+      walk_allowed_assocs(rest, sub_fields)
+    else
+      _ -> nil
+    end
+  end
+
+  defp existing_atom(name) do
+    {:ok, String.to_existing_atom(name)}
+  rescue
+    ArgumentError -> :error
   end
 end

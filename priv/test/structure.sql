@@ -11,6 +11,7 @@ CREATE TABLE authors (
   id SERIAL PRIMARY KEY,
   name VARCHAR(255),
   email VARCHAR(255),
+  hired_on DATE,
   company_id INTEGER REFERENCES companies(id)
 );
 
@@ -26,5 +27,7 @@ CREATE TABLE test_items (
   status VARCHAR(255),
   metadata JSONB,
   created_at TIMESTAMP WITH TIME ZONE,
+  performed_on DATE,
+  balance NUMERIC(12, 2),
   author_id INTEGER REFERENCES authors(id)
 );

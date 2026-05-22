@@ -272,6 +272,73 @@ defmodule EctoQueryParser.Integration.QueryExecutionTest do
     end
   end
 
+  # -- Literal type coercion --
+  #
+  # These tests cover the case where a string/integer literal is compared to a
+  # typed column (date, datetime, decimal). Without coercion, Postgres rejects
+  # the query with "operator does not exist: date >= text" or similar.
+
+  describe "literal type coercion" do
+    test "production-style query: string field AND date column with string literal" do
+      assert run(~s{status == "n" AND performed_on >= "2026-05-20"}) == []
+    end
+
+    test "date column with string literal (>=)" do
+      assert run(~s{performed_on >= "2026-05-20"}) == []
+    end
+
+    test "date column with string literal (==)" do
+      assert run(~s{performed_on == "2026-05-20"}) == []
+    end
+
+    test "date column with string literal (<=)" do
+      assert run(~s{performed_on <= "2026-05-20"}) == []
+    end
+
+    test "date column with string literal (!=)" do
+      assert run(~s{performed_on != "2026-05-20"}) == []
+    end
+
+    test "literal on the left side of comparison" do
+      assert run(~s{"2026-05-20" <= performed_on}) == []
+    end
+
+    test "utc_datetime column with ISO8601 string" do
+      assert run(~s{created_at >= "2026-05-20T10:00:00Z"}) == []
+    end
+
+    test "decimal column with integer literal" do
+      assert run(~s{balance >= 100}) == []
+    end
+
+    test "decimal column with float literal" do
+      assert run(~s{balance <= 99.99}) == []
+    end
+
+    test "dotted association with date column" do
+      assert run(~s{author.hired_on >= "2026-01-01"}) == []
+    end
+
+    test "schemaless: date coercion via keyword allowed_fields" do
+      assert run_schemaless(~s{performed_on >= "2026-05-20"},
+               allowed_fields: [performed_on: :date, status: :string]
+             ) == []
+    end
+
+    test "schemaless: nested association with date type" do
+      author_assoc =
+        {:assoc,
+         table: "authors",
+         owner_key: :author_id,
+         related_key: :id,
+         fields: [name: :string, hired_on: :date]}
+
+      assert run_schemaless(~s{author.hired_on >= "2026-01-01"},
+               allowed_fields: [author: author_assoc]
+             ) == []
+    end
+  end
+
   # -- Schemaless queries --
 
   @author_assoc {:assoc,

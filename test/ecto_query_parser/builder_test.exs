@@ -547,6 +547,167 @@ defmodule EctoQueryParser.BuilderTest do
     end
   end
 
+  describe "literal type coercion" do
+    test "schema-typed date field with string literal wraps in type/2" do
+      assert {:ok, query} = build(~s{performed_on >= "2026-05-20"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "schema-typed date field with == operator" do
+      assert {:ok, query} = build(~s{performed_on == "2026-05-20"})
+      assert inspect(query) =~ "type("
+    end
+
+    test "schema-typed utc_datetime with ISO8601 string" do
+      assert {:ok, query} = build(~s{created_at >= "2026-05-20T10:00:00Z"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":utc_datetime"
+    end
+
+    test "schema-typed decimal field coerces integer literal" do
+      assert {:ok, query} = build(~s{balance >= 100})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":decimal"
+    end
+
+    test "reversed operand order still coerces (literal on the left)" do
+      assert {:ok, query} = build(~s{"2026-05-20" <= performed_on})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "production-style mixed query" do
+      assert {:ok, query} = build(~s{status == "n" AND performed_on >= "2026-05-20"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+      # status is :string, no coercion needed there
+      assert query_str =~ "status"
+    end
+
+    test "string field with string literal: no type wrapping" do
+      assert {:ok, query} = build(~s{name == "alice"})
+      refute inspect(query) =~ "type("
+    end
+
+    test "integer field with integer literal: no type wrapping" do
+      assert {:ok, query} = build(~s{age == 42})
+      refute inspect(query) =~ "type("
+    end
+
+    test "float field with float literal: no type wrapping" do
+      assert {:ok, query} = build(~s{score == 3.14})
+      refute inspect(query) =~ "type("
+    end
+
+    test "boolean field with boolean literal: no type wrapping" do
+      assert {:ok, query} = build(~s{active == true})
+      refute inspect(query) =~ "type("
+    end
+
+    test "field-vs-field comparison: no coercion" do
+      assert {:ok, query} = build(~s{created_at >= created_at})
+      refute inspect(query) =~ "type("
+    end
+
+    test "dotted association: leaf field type drives coercion" do
+      assert {:ok, query} = build(~s{author.hired_on >= "2026-01-01"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+      assert query_str =~ "left_join"
+    end
+
+    test "schemaless mode with keyword allowed_fields coerces date" do
+      import Ecto.Query, only: [from: 1]
+
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 from("test_items"),
+                 ~s{performed_on >= "2026-05-20"},
+                 allowed_fields: [performed_on: :date, status: :string]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "schemaless mode: nested assoc coerces leaf date type" do
+      assoc =
+        {:assoc,
+         table: "authors",
+         owner_key: :author_id,
+         related_key: :id,
+         fields: [name: :string, hired_on: :date]}
+
+      import Ecto.Query, only: [from: 1]
+
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 from("test_items"),
+                 ~s{author.hired_on >= "2026-01-01"},
+                 allowed_fields: [author: assoc]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "JSON sub-path with date type coerces literal" do
+      assert {:ok, query} =
+               build(~s{metadata.start >= "2026-05-20"},
+                 allowed_fields: [metadata: :map, "metadata.start": :date]
+               )
+
+      query_str = inspect(query)
+      # type appears twice: once wrapping json_extract_path, once wrapping the literal
+      assert query_str =~ ~s|metadata["start"]|
+      assert query_str =~ ":date"
+    end
+
+    test "includes coerces element for typed array (schemaless)" do
+      import Ecto.Query, only: [from: 1]
+
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 from("test_items"),
+                 ~s{event_dates includes "2026-05-20"},
+                 allowed_fields: [event_dates: {:array, :date}]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "includes on {:array, :string} field: no type wrapping" do
+      assert {:ok, query} = build(~s{tags includes "elixir"})
+      refute inspect(query) =~ "type("
+    end
+
+    test "unknown field still errors before coercion" do
+      assert {:error, "unknown field: nonexistent_field_xyz"} =
+               build(~s{nonexistent_field_xyz >= "2026-05-20"})
+    end
+
+    test "coercion respects allowed_fields override of schema type" do
+      # If user explicitly types a field via allowed_fields, that wins over schema
+      assert {:ok, query} =
+               build(~s{performed_on >= "2026-05-20"},
+                 allowed_fields: [performed_on: :date]
+               )
+
+      assert inspect(query) =~ "type("
+    end
+  end
+
   describe "keyword allowed_fields" do
     test "keyword format allows permitted fields" do
       assert {:ok, _query} =
