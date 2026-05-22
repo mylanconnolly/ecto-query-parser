@@ -52,6 +52,17 @@ defmodule EctoQueryParser.Builder do
     to_dynamic(ast, opts)
   end
 
+  # EXISTS: emitted by EctoQueryParser.ExistsRewriter for has_many /
+  # many_to_many references. The inner AST is built against the nested
+  # context (`sub_opts`), then wrapped in a correlated subquery.
+  defp to_dynamic({:exists, _binding, kind, aopts, inner_ast, sub_opts}, opts) do
+    with {:ok, inner_dynamic, inner_joins} <- to_dynamic(inner_ast, sub_opts) do
+      source_binding = Keyword.get(opts, :source_binding, :__eqp_source)
+      subq = build_exists_subquery(kind, aopts, inner_dynamic, inner_joins, source_binding)
+      {:ok, dynamic([_row], exists(subquery(subq))), []}
+    end
+  end
+
   # AND: reduce list of conditions with `and`
   defp to_dynamic({:and, [first | rest]}, opts) do
     with {:ok, acc, joins} <- to_dynamic(first, opts) do
@@ -385,20 +396,19 @@ defmodule EctoQueryParser.Builder do
     case String.split(name, ".", parts: 2) do
       [first, rest] ->
         first_atom = String.to_atom(first)
+        value = Keyword.get(fields, first_atom)
 
-        case Keyword.get(fields, first_atom) do
-          {:assoc, assoc_opts} ->
-            nested_fields = Keyword.get(assoc_opts, :fields, [])
-            rest_atom = String.to_atom(rest)
+        if singular_assoc?(value) do
+          nested_fields = Keyword.get(assoc_opts(value), :fields, [])
+          rest_atom = String.to_atom(rest)
 
-            if nested_fields == [] or Keyword.has_key?(nested_fields, rest_atom) do
-              :ok
-            else
-              check_nested_field(rest_atom, nested_fields)
-            end
-
-          _ ->
-            {:error, "field not allowed: #{name}"}
+          if nested_fields == [] or Keyword.has_key?(nested_fields, rest_atom) do
+            :ok
+          else
+            check_nested_field(rest_atom, nested_fields)
+          end
+        else
+          {:error, "field not allowed: #{name}"}
         end
 
       _ ->
@@ -417,20 +427,22 @@ defmodule EctoQueryParser.Builder do
   end
 
   defp resolve_dotted_from_allowed_fields(name, first_segment, dotted_atom, opts) do
-    case get_field_type(first_segment, opts) do
-      :map ->
+    value = get_field_type(first_segment, opts)
+
+    cond do
+      value == :map ->
         cast_type = get_field_type(dotted_atom, opts)
         resolve_json_path(name, cast_type, opts)
 
-      {:assoc, _} ->
+      singular_assoc?(value) ->
         resolve_schemaless_join(name, opts)
 
-      nil ->
+      value == nil ->
         {:error,
          "cannot resolve dotted identifier #{name}: " <>
            "no schema available and #{first_segment} is not defined in allowed_fields"}
 
-      _ ->
+      true ->
         {:error,
          "cannot resolve dotted identifier #{name}: " <>
            "#{first_segment} is not an association or map field"}
@@ -458,9 +470,11 @@ defmodule EctoQueryParser.Builder do
 
   defp walk_schemaless_assocs([segment | rest], fields, parent, path, joins) do
     assoc_atom = String.to_atom(segment)
+    value = Keyword.get(fields, assoc_atom)
 
-    case Keyword.get(fields, assoc_atom) do
-      {:assoc, assoc_opts} ->
+    cond do
+      singular_assoc?(value) ->
+        assoc_opts = assoc_opts(value)
         new_path = path ++ [segment]
         binding = new_path |> Enum.join("__") |> String.to_atom()
 
@@ -469,17 +483,18 @@ defmodule EctoQueryParser.Builder do
           table: Keyword.fetch!(assoc_opts, :table),
           owner_key: Keyword.fetch!(assoc_opts, :owner_key),
           related_key: Keyword.fetch!(assoc_opts, :related_key),
-          parent: parent
+          parent: parent,
+          prefix: Keyword.get(assoc_opts, :prefix)
         }
 
         sub_fields = Keyword.get(assoc_opts, :fields, [])
         walk_schemaless_assocs(rest, sub_fields, binding, new_path, [join_spec | joins])
 
-      nil ->
+      value == nil ->
         {:error, "unknown association: #{segment}"}
 
-      _ ->
-        {:error, "#{segment} is not an association"}
+      true ->
+        {:error, "#{segment} is not a belongs-to association"}
     end
   end
 
@@ -615,10 +630,12 @@ defmodule EctoQueryParser.Builder do
             end
 
           :error ->
-            case get_field_type(first_segment, opts) do
-              :map -> json_path_field_type(name, opts)
-              {:assoc, _} -> allowed_assoc_field_type(name, opts)
-              _ -> nil
+            value = get_field_type(first_segment, opts)
+
+            cond do
+              value == :map -> json_path_field_type(name, opts)
+              singular_assoc?(value) -> allowed_assoc_field_type(name, opts)
+              true -> nil
             end
         end
 
@@ -672,8 +689,9 @@ defmodule EctoQueryParser.Builder do
 
   defp walk_allowed_assocs([head | rest], fields) do
     with {:ok, atom} <- existing_atom(head),
-         {:assoc, assoc_opts} <- Keyword.get(fields, atom) do
-      sub_fields = Keyword.get(assoc_opts, :fields, [])
+         value when not is_nil(value) <- Keyword.get(fields, atom),
+         true <- singular_assoc?(value) do
+      sub_fields = Keyword.get(assoc_opts(value), :fields, [])
       walk_allowed_assocs(rest, sub_fields)
     else
       _ -> nil
@@ -685,4 +703,71 @@ defmodule EctoQueryParser.Builder do
   rescue
     ArgumentError -> :error
   end
+
+  # --- Association tuple helpers ---
+
+  # `{:assoc, ...}` is preserved as a backward-compatible alias for
+  # `{:belongs_to, ...}`. Plural assocs (`:has_many`, `:many_to_many`) are
+  # detected here for completeness but are never traversed as singular —
+  # they are rewritten out of the AST by EctoQueryParser.ExistsRewriter
+  # before the Builder sees them.
+  defp assoc_kind({:assoc, _}), do: :belongs_to
+  defp assoc_kind({:belongs_to, _}), do: :belongs_to
+  defp assoc_kind({:has_many, _}), do: :has_many
+  defp assoc_kind({:many_to_many, _}), do: :many_to_many
+  defp assoc_kind(_), do: nil
+
+  defp assoc_opts({_kind, opts}) when is_list(opts), do: opts
+
+  defp singular_assoc?(value), do: assoc_kind(value) == :belongs_to
+
+  # --- EXISTS subquery construction ---
+
+  defp build_exists_subquery(:has_many, aopts, inner_dynamic, inner_joins, source_binding) do
+    base = source_query(aopts.table, aopts.prefix)
+    owner_key = aopts.owner_key
+    related_key = aopts.related_key
+
+    base
+    |> where(
+      [t],
+      field(t, ^related_key) == field(parent_as(^source_binding), ^owner_key)
+    )
+    |> EctoQueryParser.Joins.apply(inner_joins)
+    |> where(^inner_dynamic)
+    |> select([_], 1)
+  end
+
+  defp build_exists_subquery(:many_to_many, aopts, inner_dynamic, inner_joins, source_binding) do
+    target_base = source_query(aopts.table, aopts.prefix)
+    join_source = source_expr(aopts.join_through, aopts.join_prefix)
+    owner_key = aopts.owner_key
+    related_key = aopts.related_key
+    join_owner_key = aopts.join_owner_key
+    join_related_key = aopts.join_related_key
+
+    target_base
+    |> join(:inner, [t], jt in ^join_source,
+      on: field(jt, ^join_related_key) == field(t, ^related_key)
+    )
+    |> where(
+      [t, jt],
+      field(jt, ^join_owner_key) == field(parent_as(^source_binding), ^owner_key)
+    )
+    |> EctoQueryParser.Joins.apply(inner_joins)
+    |> where(^inner_dynamic)
+    |> select([_], 1)
+  end
+
+  # Build a base %Ecto.Query{} from a string table name, applying the prefix
+  # to the FromExpr so the subquery sources from the right schema namespace.
+  defp source_query(table, nil), do: Ecto.Queryable.to_query(table)
+
+  defp source_query(table, prefix) when is_binary(prefix) do
+    query = Ecto.Queryable.to_query(table)
+    %{query | from: %{query.from | prefix: prefix}}
+  end
+
+  defp source_expr(table, nil), do: table
+  defp source_expr(table, prefix) when is_binary(prefix), do: {prefix, table}
 end

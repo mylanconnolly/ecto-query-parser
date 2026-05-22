@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`has_many` and `many_to_many` relationship support.** Plural-side filters
+  now compile to correlated `EXISTS` subqueries instead of `LEFT JOIN`s,
+  avoiding the row-duplication that previously corrupted counts and
+  `ORDER BY` / `LIMIT` on schema-based has-many filters.
+- New schemaless `allowed_fields` tuple shapes peer with the existing
+  `{:assoc, ...}`:
+  - `{:belongs_to, table:, owner_key:, related_key:, fields:, prefix:}` —
+    alias for `{:assoc, ...}`.
+  - `{:has_many, table:, owner_key:, related_key:, fields:, prefix:}` —
+    emits `EXISTS (SELECT 1 FROM table WHERE related_key = parent.owner_key …)`.
+  - `{:many_to_many, table:, join_through:, join_owner_key:,
+     join_related_key:, owner_key:, related_key:, fields:, prefix:,
+     join_prefix:}` — emits `EXISTS` through the join table.
+- Schema-mode association cardinality is auto-detected from
+  `__schema__(:association, name)`. `belongs_to` and `has_one` keep
+  producing `LEFT JOIN`; `has_many` and `many_to_many` switch to `EXISTS`.
+- §4-style grouping: when multiple predicates filter the same plural alias
+  under the same boolean connector, they collapse into one `EXISTS`. AND
+  on `comments.body` and `comments.spam` produces a single subquery whose
+  WHERE clause combines both predicates; OR similarly OR-s them inside one
+  `EXISTS`. Predicates on different aliases stay in separate `EXISTS`
+  clauses.
+- `:prefix` option on `belongs_to`, `has_many`, and `many_to_many` tuples
+  (also `:join_prefix` on `many_to_many`) flows through to the
+  `LEFT JOIN` source or `EXISTS` subquery's `FROM` / `JOIN`. This
+  eliminates the need for downstream `JoinExpr.prefix` patching when
+  using schema prefixes for multi-tenancy.
+
+### Changed
+
+- **Schema-mode `has_many` filtering** previously emitted a `LEFT JOIN`
+  that silently duplicated parent rows for each match. It now emits an
+  `EXISTS` subquery and never duplicates. This is a deliberate fix; users
+  who were applying `DISTINCT` externally to compensate can remove it.
+- `EctoQueryParser.apply/3` now normalizes the queryable to an
+  `%Ecto.Query{}` and names the source binding (`as: :__eqp_source`) if
+  the user hasn't named it. This lets the EXISTS subquery's `parent_as`
+  correlation reference the outer source. A user-supplied `as:` on the
+  source is preserved.
+
+### Limitations (v1)
+
+- Plural associations must be the **first segment** of a dotted path:
+  `comments.author.name` works, but `author.comments.body` returns an
+  error. This restriction may be lifted in a follow-up.
+- `NOT EXISTS` filters ("posts with no comments") are not yet supported
+  — they require parser-level negation, which is a separate change.
+
 ## v0.2.0
 
 - Automatic literal type coercion in comparisons. When a literal is compared

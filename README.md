@@ -118,20 +118,51 @@ Repo.all(query)
 
 ### Association Joins
 
-Dotted identifiers automatically resolve to `LEFT JOIN` clauses using the
-schema's associations. Multiple references to the same association produce a
-single join. Multi-level nesting is supported.
+Dotted identifiers automatically resolve to SQL based on the association's
+cardinality. **`belongs_to`** and **`has_one`** produce `LEFT JOIN` clauses;
+**`has_many`** and **`many_to_many`** produce correlated `EXISTS` subqueries
+(so plural matches don't duplicate parent rows). Multiple references to the
+same singular association deduplicate into a single join.
 
 ```elixir
-# Single join
+# belongs_to → LEFT JOIN
 {:ok, query} = EctoQueryParser.apply(Post, ~s{author.name == "alice"})
 
-# Multi-level join
+# Multi-level belongs_to → multiple LEFT JOINs
 {:ok, query} = EctoQueryParser.apply(Post, ~s{author.company.name == "Acme"})
 
 # Deduplication: only one join for author
 {:ok, query} = EctoQueryParser.apply(Post, ~s{author.name == "alice" AND author.email contains "example"})
+
+# has_many → EXISTS (no row duplication)
+{:ok, query} = EctoQueryParser.apply(Post, ~s{comments.body contains "ship"})
+
+# many_to_many → EXISTS through the join table
+{:ok, query} = EctoQueryParser.apply(Post, ~s{tags.name == "elixir"})
 ```
+
+When multiple predicates reference the same plural alias under the same
+boolean connector, they collapse into a single EXISTS:
+
+```elixir
+# One EXISTS clause, both predicates AND-ed inside:
+EctoQueryParser.apply(Post, ~s{comments.spam == false AND comments.body contains "ship"})
+
+# Different plural aliases stay separate:
+EctoQueryParser.apply(Post, ~s{comments.body contains "x" AND likes.user_id == 42})
+```
+
+v1 restriction: a plural association may only appear as the first segment of
+a dotted path. `comments.author.name` is allowed (plural first, then
+belongs_to); `author.comments.body` is not.
+
+#### Performance note
+
+`EXISTS` subqueries on plural associations rely on an index covering the
+child-side FK column (`comments(post_id)`, `post_tags(post_id)`, etc.). The
+SQL is otherwise correct but can fall off a performance cliff against a
+large table without that index. Add one if you're filtering through a
+plural association on a non-trivial dataset.
 
 ### JSONB Column Access
 
@@ -183,42 +214,62 @@ Fields not in the list return `{:error, "field not allowed: ..."}`.
 
 ### Schemaless Queries
 
-When working with a string table name instead of a schema module, you can define
-associations directly in `:allowed_fields`:
+When working with a string table name instead of a schema module, define
+associations directly in `:allowed_fields`. Three relationship tuples are
+supported; `{:assoc, ...}` is a backward-compatible alias for `{:belongs_to, ...}`.
 
 ```elixir
 import Ecto.Query
 
 allowed = [
   name: :string,
-  author: {:assoc,
+
+  # belongs_to → LEFT JOIN
+  author: {:belongs_to,
     table: "users",
     owner_key: :author_id,
     related_key: :id,
-    fields: [
-      name: :string,
-      email: :string,
-      company: {:assoc,
-        table: "companies",
-        owner_key: :company_id,
-        related_key: :id,
-        fields: [name: :string]}
-    ]}
+    fields: [name: :string, email: :string]},
+
+  # has_many → EXISTS subquery
+  comments: {:has_many,
+    table: "comments",
+    owner_key: :id,
+    related_key: :post_id,
+    fields: [body: :string, spam: :boolean]},
+
+  # many_to_many → EXISTS through join table
+  tags: {:many_to_many,
+    table: "tags",
+    join_through: "post_tags",
+    join_owner_key: :post_id,
+    join_related_key: :tag_id,
+    owner_key: :id,
+    related_key: :id,
+    fields: [name: :string]}
 ]
 
 {:ok, query} = EctoQueryParser.apply(
   from("posts"),
-  ~s{author.company.name == "Acme"},
+  ~s{author.name == "alice" AND comments.body contains "ship"},
   allowed_fields: allowed
 )
 ```
 
-Association options:
+Common options (all three tuples accept these):
 
 - `:table` (required) - target table name as a string
-- `:owner_key` (required) - foreign key on the source table
-- `:related_key` (required) - primary key on the target table
 - `:fields` (optional) - keyword list of permitted fields, supports nesting
+- `:prefix` (optional) - schema prefix for the target table (multi-tenant)
+
+`belongs_to` / `has_many` additionally require `:owner_key` and `:related_key`.
+For `belongs_to`, `:owner_key` is the FK on the source and `:related_key` is
+the PK on the target; for `has_many` they are swapped (PK on source, FK on
+target).
+
+`many_to_many` additionally requires `:join_through` (the join table name),
+`:join_owner_key` and `:join_related_key` (the join table's FK columns), and
+optionally `:join_prefix` (a schema prefix for the join table).
 
 ### Error Handling
 

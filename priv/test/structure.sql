@@ -1,3 +1,5 @@
+DROP TABLE IF EXISTS post_tags;
+DROP TABLE IF EXISTS tags;
 DROP TABLE IF EXISTS test_items;
 DROP TABLE IF EXISTS authors;
 DROP TABLE IF EXISTS companies;
@@ -31,3 +33,16 @@ CREATE TABLE test_items (
   balance NUMERIC(12, 2),
   author_id INTEGER REFERENCES authors(id)
 );
+
+CREATE TABLE tags (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255)
+);
+
+CREATE TABLE post_tags (
+  post_id INTEGER REFERENCES test_items(id),
+  tag_id INTEGER REFERENCES tags(id),
+  PRIMARY KEY (post_id, tag_id)
+);
+
+CREATE INDEX ON post_tags(tag_id);

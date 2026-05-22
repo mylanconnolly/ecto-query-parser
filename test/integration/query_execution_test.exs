@@ -381,4 +381,72 @@ defmodule EctoQueryParser.Integration.QueryExecutionTest do
              ) == []
     end
   end
+
+  describe "plural associations (EXISTS subqueries)" do
+    @posts_assoc {:has_many,
+                  table: "test_items",
+                  owner_key: :id,
+                  related_key: :author_id,
+                  fields: [body: :string, name: :string]}
+
+    @tags_assoc {:many_to_many,
+                 table: "tags",
+                 join_through: "post_tags",
+                 join_owner_key: :post_id,
+                 join_related_key: :tag_id,
+                 owner_key: :id,
+                 related_key: :id,
+                 fields: [name: :string]}
+
+    test "schemaless has_many EXISTS executes against Postgres" do
+      base = from(t in "test_items", select: %{id: t.id})
+
+      assert {:ok, query} =
+               EctoQueryParser.apply(base, ~s{posts.body contains "ship"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      assert TestRepo.all(query) == []
+    end
+
+    test "schemaless many_to_many EXISTS executes against Postgres" do
+      base = from(t in "test_items", select: %{id: t.id})
+
+      assert {:ok, query} =
+               EctoQueryParser.apply(base, ~s{tags.name == "elixir"},
+                 allowed_fields: [tags: @tags_assoc]
+               )
+
+      assert TestRepo.all(query) == []
+    end
+
+    test "schema-mode has_many EXISTS executes against Postgres" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(EctoQueryParser.Test.Author,
+                 ~s{posts.name == "anything"})
+
+      assert TestRepo.all(query) == []
+    end
+
+    test "schema-mode many_to_many EXISTS executes against Postgres" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(EctoQueryParser.Test.TestSchema,
+                 ~s{tag_list.name == "elixir"})
+
+      assert TestRepo.all(query) == []
+    end
+
+    test "same-alias AND merges into single EXISTS that executes" do
+      base = from(t in "test_items", select: %{id: t.id})
+
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 base,
+                 ~s{posts.body contains "ship" AND posts.name == "x"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      assert TestRepo.all(query) == []
+    end
+  end
 end

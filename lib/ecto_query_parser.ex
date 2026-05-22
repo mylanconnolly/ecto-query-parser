@@ -39,25 +39,72 @@ defmodule EctoQueryParser do
       Dotted paths use atom notation (e.g., `:"author.name"`).
 
     * **Schemaless queries** — when using a string table name (e.g., `from("posts")`),
-      associations can be defined directly in `allowed_fields` using `{:assoc, opts}` tuples:
+      associations can be defined directly in `allowed_fields`. Three relationship
+      kinds are recognized; `{:assoc, opts}` remains a backward-compatible alias
+      for `{:belongs_to, opts}`.
 
           allowed_fields: [
             name: :string,
-            author: {:assoc,
+
+            # belongs_to (LEFT JOIN)
+            author: {:belongs_to,
               table: "users",
               owner_key: :author_id,
               related_key: :id,
-              fields: [name: :string, email: :string]}
+              fields: [name: :string, email: :string]},
+
+            # has_many (EXISTS subquery; no row duplication)
+            comments: {:has_many,
+              table: "comments",
+              owner_key: :id,
+              related_key: :post_id,
+              fields: [body: :string, spam: :boolean]},
+
+            # many_to_many (EXISTS through join table)
+            tags: {:many_to_many,
+              table: "tags",
+              join_through: "post_tags",
+              join_owner_key: :post_id,
+              join_related_key: :tag_id,
+              owner_key: :id,
+              related_key: :id,
+              fields: [name: :string]}
           ]
 
-      Association options:
+      Options shared by all three:
         - `:table` — target table name (string, required)
-        - `:owner_key` — FK on the source table (atom, required)
-        - `:related_key` — PK on the target table (atom, required)
-        - `:fields` — keyword list of available fields, supports nesting (optional,
-          defaults to `[]` meaning all fields allowed)
+        - `:fields` — nested allowed_fields; supports further nesting (optional)
+        - `:prefix` — schema prefix for the target table (optional, multi-tenant)
 
-      When a schema IS available, it takes priority (fully backward compatible).
+      `belongs_to` and `has_many` additionally require:
+        - `:owner_key` — FK on the source for belongs_to; PK on the source for has_many
+        - `:related_key` — PK on the target for belongs_to; FK on the target for has_many
+
+      `many_to_many` additionally requires:
+        - `:join_through` — name of the join table (string)
+        - `:join_owner_key` — FK in the join table pointing at the source
+        - `:join_related_key` — FK in the join table pointing at the target
+        - `:owner_key` / `:related_key` — the columns those FKs point at
+        - `:join_prefix` — optional schema prefix for the join table
+
+      When an Ecto schema is available, association cardinality is auto-detected
+      from `__schema__(:association, name)` — `belongs_to`/`has_one` use
+      `LEFT JOIN`, `has_many`/`many_to_many` use `EXISTS`. No annotation needed.
+
+  ## Plural-association semantics
+
+  When multiple predicates filter the same plural alias under the same boolean
+  connector, they collapse into one EXISTS subquery:
+
+  - `comments.spam == false AND comments.body contains "ship"` — one EXISTS,
+    both predicates AND-ed inside.
+  - `comments.spam == false OR comments.body contains "ship"` — one EXISTS,
+    predicates OR-ed inside.
+  - Predicates on different plural aliases produce separate EXISTS clauses.
+
+  v1 restriction: a plural association may only appear as the first segment
+  of a dotted path. `comments.author.name` is allowed; `author.comments.body`
+  returns an error.
 
   Returns `{:ok, query}` or `{:error, reason}`.
   """
@@ -65,16 +112,31 @@ defmodule EctoQueryParser do
     schema = extract_schema(queryable)
     builder_opts = if schema, do: Keyword.put(opts, :schema, schema), else: opts
 
+    query = ensure_source_binding(Ecto.Queryable.to_query(queryable))
+    source_binding = query.from.as
+    builder_opts = Keyword.put(builder_opts, :source_binding, source_binding)
+
     with {:ok, ast} <- parse(query_string),
-         {:ok, dynamic_expr, joins} <- EctoQueryParser.Builder.build(ast, builder_opts) do
+         {:ok, rewritten} <- EctoQueryParser.ExistsRewriter.rewrite(ast, builder_opts),
+         {:ok, dynamic_expr, joins} <- EctoQueryParser.Builder.build(rewritten, builder_opts) do
       query =
-        queryable
-        |> apply_joins(joins)
+        query
+        |> EctoQueryParser.Joins.apply(joins)
         |> where(^dynamic_expr)
 
       {:ok, query}
     end
   end
+
+  # Names the source binding so EXISTS subqueries can reference it via
+  # `parent_as(^name)`. If the user already named the source, keep theirs;
+  # otherwise patch in `:__eqp_source`. Updates both `from.as` and the
+  # `aliases` registry — Ecto looks up named bindings in the latter.
+  defp ensure_source_binding(%Ecto.Query{from: %{as: nil} = from, aliases: aliases} = query) do
+    %{query | from: %{from | as: :__eqp_source}, aliases: Map.put(aliases, :__eqp_source, 0)}
+  end
+
+  defp ensure_source_binding(%Ecto.Query{} = query), do: query
 
   defp extract_schema(module) when is_atom(module) do
     (Code.ensure_loaded?(module) and function_exported?(module, :__schema__, 1) and module) || nil
@@ -87,64 +149,4 @@ defmodule EctoQueryParser do
 
   defp extract_schema(_), do: nil
 
-  defp apply_joins(queryable, joins) do
-    joins
-    |> deduplicate_joins()
-    |> Enum.reduce(queryable, fn join_spec, query ->
-      if has_named_binding?(query, join_spec.binding) do
-        query
-      else
-        apply_single_join(query, join_spec)
-      end
-    end)
-  end
-
-  defp deduplicate_joins(joins) do
-    joins
-    |> Enum.uniq_by(& &1.binding)
-  end
-
-  # Schemaless joins: pattern match on :table key
-  defp apply_single_join(query, %{
-         binding: binding,
-         table: table,
-         owner_key: ok,
-         related_key: rk,
-         parent: :root
-       }) do
-    from(row in query,
-      left_join: related in ^table,
-      on: field(related, ^rk) == field(row, ^ok),
-      as: ^binding
-    )
-  end
-
-  defp apply_single_join(query, %{
-         binding: binding,
-         table: table,
-         owner_key: ok,
-         related_key: rk,
-         parent: parent
-       }) do
-    from([{^parent, p}] in query,
-      left_join: related in ^table,
-      on: field(related, ^rk) == field(p, ^ok),
-      as: ^binding
-    )
-  end
-
-  # Schema-based joins: pattern match on :assoc key
-  defp apply_single_join(query, %{binding: binding, assoc: assoc, parent: :root}) do
-    from(row in query,
-      left_join: related in assoc(row, ^assoc),
-      as: ^binding
-    )
-  end
-
-  defp apply_single_join(query, %{binding: binding, assoc: assoc, parent: parent}) do
-    from([{^parent, p}] in query,
-      left_join: related in assoc(p, ^assoc),
-      as: ^binding
-    )
-  end
 end

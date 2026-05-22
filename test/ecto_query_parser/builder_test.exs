@@ -777,4 +777,304 @@ defmodule EctoQueryParser.BuilderTest do
       assert query.joins == []
     end
   end
+
+  describe "plural associations (has_many, many_to_many)" do
+    import Ecto.Query, only: [from: 1, from: 2]
+
+    @posts_assoc {:has_many,
+                  table: "test_items",
+                  owner_key: :id,
+                  related_key: :author_id,
+                  fields: [body: :string, status: :string]}
+
+    @likes_assoc {:has_many,
+                  table: "likes",
+                  owner_key: :id,
+                  related_key: :post_id,
+                  fields: [user_id: :integer]}
+
+    @tags_assoc {:many_to_many,
+                 table: "tags",
+                 join_through: "post_tags",
+                 join_owner_key: :post_id,
+                 join_related_key: :tag_id,
+                 owner_key: :id,
+                 related_key: :id,
+                 fields: [name: :string]}
+
+    @comments_with_author {:has_many,
+                           table: "comments",
+                           owner_key: :id,
+                           related_key: :post_id,
+                           fields: [
+                             body: :string,
+                             status: :string,
+                             author:
+                               {:belongs_to,
+                                table: "authors",
+                                owner_key: :author_id,
+                                related_key: :id,
+                                fields: [name: :string]}
+                           ]}
+
+    defp plural_build(query_string, opts) do
+      EctoQueryParser.apply(from("test_items"), query_string, opts)
+    end
+
+    # 1. :belongs_to alias of :assoc still produces LEFT JOIN
+    test "belongs_to tag is an alias of :assoc (LEFT JOIN unchanged)" do
+      author = {:belongs_to,
+                table: "authors",
+                owner_key: :author_id,
+                related_key: :id,
+                fields: [name: :string]}
+
+      assert {:ok, query} =
+               plural_build(~s{author.name == "alice"}, allowed_fields: [author: author])
+
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ "authors"
+      refute query_str =~ "exists("
+    end
+
+    # 2. schemaless has_many produces EXISTS
+    test "has_many produces EXISTS subquery, no LEFT JOIN" do
+      assert {:ok, query} =
+               plural_build(~s{posts.body contains "ship"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ "test_items"
+      assert query.joins == []
+    end
+
+    # 3. AND on same plural alias collapses into one EXISTS
+    test "AND on same plural alias collapses to one EXISTS with combined predicates" do
+      assert {:ok, query} =
+               plural_build(
+                 ~s{posts.status == "live" AND posts.body contains "ship"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      query_str = inspect(query)
+      # Exactly one EXISTS clause for the plural binding
+      assert occurrences(query_str, "exists(") == 1
+      assert query_str =~ "live"
+      assert query_str =~ "ship"
+    end
+
+    # 4. OR on same plural alias collapses into one EXISTS with OR inside
+    test "OR on same plural alias collapses to one EXISTS with OR-ed predicates" do
+      assert {:ok, query} =
+               plural_build(
+                 ~s{posts.status == "live" OR posts.body contains "ship"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      query_str = inspect(query)
+      assert occurrences(query_str, "exists(") == 1
+      assert query_str =~ " or "
+    end
+
+    # 5. Two distinct plural aliases → two EXISTS clauses
+    test "two distinct plural aliases produce two EXISTS clauses" do
+      assert {:ok, query} =
+               plural_build(
+                 ~s{posts.body contains "x" AND likes.user_id == 42},
+                 allowed_fields: [posts: @posts_assoc, likes: @likes_assoc]
+               )
+
+      query_str = inspect(query)
+      assert occurrences(query_str, "exists(") == 2
+    end
+
+    # 6. Mixed singular + plural: LEFT JOIN for singular, EXISTS for plural
+    test "singular + plural mix yields one LEFT JOIN and one EXISTS" do
+      author = {:belongs_to,
+                table: "authors",
+                owner_key: :author_id,
+                related_key: :id,
+                fields: [name: :string]}
+
+      assert {:ok, query} =
+               plural_build(
+                 ~s{author.name == "alice" AND posts.body contains "ship"},
+                 allowed_fields: [author: author, posts: @posts_assoc]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ "exists("
+      assert length(query.joins) == 1
+    end
+
+    # 7. schemaless many_to_many produces EXISTS through join table
+    test "many_to_many produces EXISTS through join table" do
+      assert {:ok, query} =
+               plural_build(~s{tags.name == "elixir"},
+                 allowed_fields: [tags: @tags_assoc]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ "post_tags"
+      assert query_str =~ "tags"
+      # inner join renders as `join:` in Ecto's inspect output (no qualifier prefix)
+      assert query_str =~ ~r/join:\s+\w+ in "post_tags"/
+    end
+
+    # 8. nested has_many → belongs_to: EXISTS containing a LEFT JOIN
+    test "nested has_many → belongs_to: EXISTS contains a LEFT JOIN" do
+      assert {:ok, query} =
+               plural_build(~s{comments.author.name == "alice"},
+                 allowed_fields: [comments: @comments_with_author]
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      # The inner LEFT JOIN renders as part of the subquery
+      assert query_str =~ "left_join"
+    end
+
+    # 9. :prefix on belongs_to surfaces in LEFT JOIN
+    test ":prefix on belongs_to uses {prefix, table} in the LEFT JOIN" do
+      author = {:belongs_to,
+                table: "authors",
+                prefix: "tenant_42",
+                owner_key: :author_id,
+                related_key: :id,
+                fields: [name: :string]}
+
+      assert {:ok, query} =
+               plural_build(~s{author.name == "alice"}, allowed_fields: [author: author])
+
+      assert inspect(query) =~ "tenant_42"
+    end
+
+    # 10. :prefix on has_many surfaces in EXISTS subquery's FROM
+    test ":prefix on has_many uses {prefix, table} in EXISTS source" do
+      posts = {:has_many,
+               table: "test_items",
+               prefix: "tenant_42",
+               owner_key: :id,
+               related_key: :author_id,
+               fields: [body: :string]}
+
+      assert {:ok, query} =
+               plural_build(~s{posts.body contains "x"}, allowed_fields: [posts: posts])
+
+      assert inspect(query) =~ "tenant_42"
+    end
+
+    # 11. unknown field on plural surfaces as an error
+    test "unknown field on plural alias errors via inner validation" do
+      assert {:error, msg} =
+               plural_build(~s{posts.bogus == 1}, allowed_fields: [posts: @posts_assoc])
+
+      assert msg =~ "bogus"
+    end
+
+    # 12. schema-mode has_many auto-detect → EXISTS
+    test "schema-mode has_many is auto-detected and produces EXISTS" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 ~s{posts.name == "alice"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      # No LEFT JOIN to posts at the outer level
+      refute Enum.any?(query.joins, fn join ->
+               match?(%{as: as} when as in [:posts], join)
+             end)
+    end
+
+    # 13. schema-mode many_to_many auto-detect → EXISTS through join table
+    test "schema-mode many_to_many is auto-detected and produces EXISTS with join" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.TestSchema,
+                 ~s{tag_list.name == "elixir"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ ~r/join:\s+\w+ in "post_tags"/
+      assert query_str =~ "post_tags"
+    end
+
+    # 14. Nested boolean tree with mixed plural references
+    test "nested boolean tree with mixed plurals keeps EXISTS clauses correctly grouped" do
+      assert {:ok, query} =
+               plural_build(
+                 ~s{posts.status == "live" AND (likes.user_id == 1 OR posts.body contains "x")},
+                 allowed_fields: [posts: @posts_assoc, likes: @likes_assoc]
+               )
+
+      query_str = inspect(query)
+      # Outer AND has two items; inner OR has two items. Each plural ref under
+      # different boolean nodes stays in its own EXISTS — three EXISTS total.
+      assert occurrences(query_str, "exists(") == 3
+    end
+
+    # 15. v1 restriction: plural can only appear as the first segment
+    test "plural at non-leading position errors with helpful message" do
+      author_with_posts =
+        {:belongs_to,
+         table: "authors",
+         owner_key: :author_id,
+         related_key: :id,
+         fields: [
+           name: :string,
+           posts:
+             {:has_many,
+              table: "test_items",
+              owner_key: :id,
+              related_key: :author_id,
+              fields: [body: :string]}
+         ]}
+
+      assert {:error, msg} =
+               plural_build(~s{author.posts.body contains "x"},
+                 allowed_fields: [author: author_with_posts]
+               )
+
+      assert msg =~ "posts"
+      assert msg =~ "first segment"
+    end
+
+    # 16. User-supplied source binding flows through to parent_as
+    test "user-named source binding is used in EXISTS parent_as" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 from(p in "test_items", as: :my_post),
+                 ~s{posts.body contains "x"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      assert query.from.as == :my_post
+      assert inspect(query) =~ "parent_as(:my_post)"
+    end
+
+    test "default source binding is :__eqp_source when user did not name it" do
+      assert {:ok, query} =
+               plural_build(~s{posts.body contains "x"},
+                 allowed_fields: [posts: @posts_assoc]
+               )
+
+      assert query.from.as == :__eqp_source
+      assert inspect(query) =~ "parent_as(:__eqp_source)"
+    end
+  end
+
+  defp occurrences(string, pattern) do
+    string
+    |> String.split(pattern)
+    |> length()
+    |> Kernel.-(1)
+  end
 end
