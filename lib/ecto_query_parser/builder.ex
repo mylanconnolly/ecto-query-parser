@@ -740,16 +740,15 @@ defmodule EctoQueryParser.Builder do
 
   defp build_exists_subquery(:many_to_many, aopts, inner_dynamic, inner_joins, source_binding) do
     target_base = source_query(aopts.table, aopts.prefix)
-    join_source = source_expr(aopts.join_through, aopts.join_prefix)
+    join_table = aopts.join_through
+    join_prefix = aopts.join_prefix
     owner_key = aopts.owner_key
     related_key = aopts.related_key
     join_owner_key = aopts.join_owner_key
     join_related_key = aopts.join_related_key
 
     target_base
-    |> join(:inner, [t], jt in ^join_source,
-      on: field(jt, ^join_related_key) == field(t, ^related_key)
-    )
+    |> add_inner_join(join_table, join_prefix, join_related_key, related_key)
     |> where(
       [t, jt],
       field(jt, ^join_owner_key) == field(parent_as(^source_binding), ^owner_key)
@@ -757,6 +756,25 @@ defmodule EctoQueryParser.Builder do
     |> EctoQueryParser.Joins.apply(inner_joins)
     |> where(^inner_dynamic)
     |> select([_], 1)
+  end
+
+  # The join target must be a bare string so Ecto can build a plain
+  # `INNER JOIN "schema"."table"`; passing `^{prefix, table}` would fall
+  # through to `Ecto.Queryable.to_query/1` which rejects {string, string}
+  # tuples, and passing `^%Ecto.Query{}` would wrap as a subquery join.
+  # Use join/5's `:prefix` keyword option for the schema prefix instead.
+  defp add_inner_join(query, table, nil, join_related_key, related_key) do
+    join(query, :inner, [t], jt in ^table,
+      on: field(jt, ^join_related_key) == field(t, ^related_key)
+    )
+  end
+
+  defp add_inner_join(query, table, prefix, join_related_key, related_key)
+       when is_binary(prefix) do
+    join(query, :inner, [t], jt in ^table,
+      on: field(jt, ^join_related_key) == field(t, ^related_key),
+      prefix: ^prefix
+    )
   end
 
   # Build a base %Ecto.Query{} from a string table name, applying the prefix
@@ -767,7 +785,4 @@ defmodule EctoQueryParser.Builder do
     query = Ecto.Queryable.to_query(table)
     %{query | from: %{query.from | prefix: prefix}}
   end
-
-  defp source_expr(table, nil), do: table
-  defp source_expr(table, prefix) when is_binary(prefix), do: {prefix, table}
 end

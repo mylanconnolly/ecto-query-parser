@@ -969,6 +969,31 @@ defmodule EctoQueryParser.BuilderTest do
       assert inspect(query) =~ "tenant_42"
     end
 
+    # 10b. :join_prefix on many_to_many: must not blow up on {string, string}
+    # tuple interpolation, and must produce a plain inner join (not a subquery
+    # join) on the prefixed join table.
+    test ":join_prefix on many_to_many uses prefix option on the inner join" do
+      tags = {:many_to_many,
+              table: "tags",
+              prefix: "public",
+              join_through: "post_tags",
+              join_prefix: "public",
+              join_owner_key: :post_id,
+              join_related_key: :tag_id,
+              owner_key: :id,
+              related_key: :id,
+              fields: [name: :string]}
+
+      assert {:ok, query} =
+               plural_build(~s{tags.name == "elixir"}, allowed_fields: [tags: tags])
+
+      query_str = inspect(query)
+      # Plain inner join — not a subquery join — and prefix applied
+      assert query_str =~ ~r/join:\s+\w+ in "post_tags"/
+      refute query_str =~ ~r/join:\s+\w+ in subquery/
+      assert query_str =~ "public"
+    end
+
     # 11. unknown field on plural surfaces as an error
     test "unknown field on plural alias errors via inner validation" do
       assert {:error, msg} =
