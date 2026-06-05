@@ -422,16 +422,20 @@ defmodule EctoQueryParser.Integration.QueryExecutionTest do
 
     test "schema-mode has_many EXISTS executes against Postgres" do
       assert {:ok, query} =
-               EctoQueryParser.apply(EctoQueryParser.Test.Author,
-                 ~s{posts.name == "anything"})
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 ~s{posts.name == "anything"}
+               )
 
       assert TestRepo.all(query) == []
     end
 
     test "schema-mode many_to_many EXISTS executes against Postgres" do
       assert {:ok, query} =
-               EctoQueryParser.apply(EctoQueryParser.Test.TestSchema,
-                 ~s{tag_list.name == "elixir"})
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.TestSchema,
+                 ~s{tag_list.name == "elixir"}
+               )
 
       assert TestRepo.all(query) == []
     end

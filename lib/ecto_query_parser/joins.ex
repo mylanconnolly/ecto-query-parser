@@ -30,13 +30,16 @@ defmodule EctoQueryParser.Joins do
   end
 
   # Schemaless join from root.
-  defp apply_one(query, %{
-         binding: binding,
-         table: table,
-         owner_key: ok,
-         related_key: rk,
-         parent: :root
-       } = spec) do
+  defp apply_one(
+         query,
+         %{
+           binding: binding,
+           table: table,
+           owner_key: ok,
+           related_key: rk,
+           parent: :root
+         } = spec
+       ) do
     prefix = Map.get(spec, :prefix)
 
     if prefix do
@@ -55,13 +58,16 @@ defmodule EctoQueryParser.Joins do
   end
 
   # Schemaless join from a named parent.
-  defp apply_one(query, %{
-         binding: binding,
-         table: table,
-         owner_key: ok,
-         related_key: rk,
-         parent: parent
-       } = spec) do
+  defp apply_one(
+         query,
+         %{
+           binding: binding,
+           table: table,
+           owner_key: ok,
+           related_key: rk,
+           parent: parent
+         } = spec
+       ) do
     prefix = Map.get(spec, :prefix)
 
     if prefix do

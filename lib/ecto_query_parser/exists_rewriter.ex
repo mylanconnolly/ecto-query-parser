@@ -64,8 +64,7 @@ defmodule EctoQueryParser.ExistsRewriter do
           {:ok, {:exists, binding, kind, aopts, {:op, op, left, inner_right}, sub_opts}}
 
         {{:plural, _, _, _, _}, {:plural, _, _, _, _}} ->
-          {:error,
-           "comparison referencing a plural association on both sides is not supported"}
+          {:error, "comparison referencing a plural association on both sides is not supported"}
       end
     end
   end

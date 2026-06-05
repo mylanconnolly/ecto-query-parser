@@ -823,11 +823,9 @@ defmodule EctoQueryParser.BuilderTest do
 
     # 1. :belongs_to alias of :assoc still produces LEFT JOIN
     test "belongs_to tag is an alias of :assoc (LEFT JOIN unchanged)" do
-      author = {:belongs_to,
-                table: "authors",
-                owner_key: :author_id,
-                related_key: :id,
-                fields: [name: :string]}
+      author =
+        {:belongs_to,
+         table: "authors", owner_key: :author_id, related_key: :id, fields: [name: :string]}
 
       assert {:ok, query} =
                plural_build(~s{author.name == "alice"}, allowed_fields: [author: author])
@@ -893,11 +891,9 @@ defmodule EctoQueryParser.BuilderTest do
 
     # 6. Mixed singular + plural: LEFT JOIN for singular, EXISTS for plural
     test "singular + plural mix yields one LEFT JOIN and one EXISTS" do
-      author = {:belongs_to,
-                table: "authors",
-                owner_key: :author_id,
-                related_key: :id,
-                fields: [name: :string]}
+      author =
+        {:belongs_to,
+         table: "authors", owner_key: :author_id, related_key: :id, fields: [name: :string]}
 
       assert {:ok, query} =
                plural_build(
@@ -941,12 +937,13 @@ defmodule EctoQueryParser.BuilderTest do
 
     # 9. :prefix on belongs_to surfaces in LEFT JOIN
     test ":prefix on belongs_to uses {prefix, table} in the LEFT JOIN" do
-      author = {:belongs_to,
-                table: "authors",
-                prefix: "tenant_42",
-                owner_key: :author_id,
-                related_key: :id,
-                fields: [name: :string]}
+      author =
+        {:belongs_to,
+         table: "authors",
+         prefix: "tenant_42",
+         owner_key: :author_id,
+         related_key: :id,
+         fields: [name: :string]}
 
       assert {:ok, query} =
                plural_build(~s{author.name == "alice"}, allowed_fields: [author: author])
@@ -956,12 +953,13 @@ defmodule EctoQueryParser.BuilderTest do
 
     # 10. :prefix on has_many surfaces in EXISTS subquery's FROM
     test ":prefix on has_many uses {prefix, table} in EXISTS source" do
-      posts = {:has_many,
-               table: "test_items",
-               prefix: "tenant_42",
-               owner_key: :id,
-               related_key: :author_id,
-               fields: [body: :string]}
+      posts =
+        {:has_many,
+         table: "test_items",
+         prefix: "tenant_42",
+         owner_key: :id,
+         related_key: :author_id,
+         fields: [body: :string]}
 
       assert {:ok, query} =
                plural_build(~s{posts.body contains "x"}, allowed_fields: [posts: posts])
@@ -973,16 +971,17 @@ defmodule EctoQueryParser.BuilderTest do
     # tuple interpolation, and must produce a plain inner join (not a subquery
     # join) on the prefixed join table.
     test ":join_prefix on many_to_many uses prefix option on the inner join" do
-      tags = {:many_to_many,
-              table: "tags",
-              prefix: "public",
-              join_through: "post_tags",
-              join_prefix: "public",
-              join_owner_key: :post_id,
-              join_related_key: :tag_id,
-              owner_key: :id,
-              related_key: :id,
-              fields: [name: :string]}
+      tags =
+        {:many_to_many,
+         table: "tags",
+         prefix: "public",
+         join_through: "post_tags",
+         join_prefix: "public",
+         join_owner_key: :post_id,
+         join_related_key: :tag_id,
+         owner_key: :id,
+         related_key: :id,
+         fields: [name: :string]}
 
       assert {:ok, query} =
                plural_build(~s{tags.name == "elixir"}, allowed_fields: [tags: tags])

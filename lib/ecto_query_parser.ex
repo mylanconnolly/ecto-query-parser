@@ -148,5 +148,4 @@ defmodule EctoQueryParser do
   end
 
   defp extract_schema(_), do: nil
-
 end
