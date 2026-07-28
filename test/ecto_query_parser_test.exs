@@ -407,6 +407,245 @@ defmodule EctoQueryParserTest do
     end
   end
 
+  describe "operator >" do
+    test "identifier > integer" do
+      assert EctoQueryParser.parse("age > 18") ==
+               {:ok, {:op, :>, {:identifier, "age"}, {:integer, 18}}}
+    end
+
+    test "identifier > float" do
+      assert EctoQueryParser.parse("score > 7.5") ==
+               {:ok, {:op, :>, {:identifier, "score"}, {:float, 7.5}}}
+    end
+
+    test "with no spaces" do
+      assert EctoQueryParser.parse("x>0") ==
+               {:ok, {:op, :>, {:identifier, "x"}, {:integer, 0}}}
+    end
+
+    test ">= still wins over > when both could match" do
+      assert EctoQueryParser.parse("age >= 18") ==
+               {:ok, {:op, :>=, {:identifier, "age"}, {:integer, 18}}}
+    end
+  end
+
+  describe "operator <" do
+    test "identifier < integer" do
+      assert EctoQueryParser.parse("age < 65") ==
+               {:ok, {:op, :<, {:identifier, "age"}, {:integer, 65}}}
+    end
+
+    test "identifier < float" do
+      assert EctoQueryParser.parse("price < 9.99") ==
+               {:ok, {:op, :<, {:identifier, "price"}, {:float, 9.99}}}
+    end
+
+    test "with no spaces" do
+      assert EctoQueryParser.parse("x<100") ==
+               {:ok, {:op, :<, {:identifier, "x"}, {:integer, 100}}}
+    end
+
+    test "<= still wins over < when both could match" do
+      assert EctoQueryParser.parse("age <= 65") ==
+               {:ok, {:op, :<=, {:identifier, "age"}, {:integer, 65}}}
+    end
+  end
+
+  describe "operator IN" do
+    test "uppercase IN with integer list" do
+      assert EctoQueryParser.parse("age IN [1, 2, 3]") ==
+               {:ok,
+                {:op, :in, {:identifier, "age"},
+                 {:list, [{:integer, 1}, {:integer, 2}, {:integer, 3}]}}}
+    end
+
+    test "lowercase in with string list" do
+      assert EctoQueryParser.parse(~s{status in ["a", "b"]}) ==
+               {:ok,
+                {:op, :in, {:identifier, "status"}, {:list, [{:string, "a"}, {:string, "b"}]}}}
+    end
+
+    test "dotted identifier IN list" do
+      assert EctoQueryParser.parse("author.id IN [1, 2]") ==
+               {:ok,
+                {:op, :in, {:identifier, "author.id"}, {:list, [{:integer, 1}, {:integer, 2}]}}}
+    end
+
+    test "does not confuse in_progress as operator" do
+      assert EctoQueryParser.parse("in_progress") ==
+               {:ok, {:identifier, "in_progress"}}
+    end
+
+    test "does not confuse index identifier with IN" do
+      assert EctoQueryParser.parse("index == 1") ==
+               {:ok, {:op, :==, {:identifier, "index"}, {:integer, 1}}}
+    end
+  end
+
+  describe "NOT" do
+    test "NOT before comparison" do
+      assert EctoQueryParser.parse(~s{NOT name == "alice"}) ==
+               {:ok, {:not, {:op, :==, {:identifier, "name"}, {:string, "alice"}}}}
+    end
+
+    test "lowercase not" do
+      assert EctoQueryParser.parse(~s{not name == "alice"}) ==
+               {:ok, {:not, {:op, :==, {:identifier, "name"}, {:string, "alice"}}}}
+    end
+
+    test "NOT before grouped expression" do
+      assert EctoQueryParser.parse("NOT (a == 1 OR b == 2)") ==
+               {:ok,
+                {:not,
+                 {:or,
+                  [
+                    {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                    {:op, :==, {:identifier, "b"}, {:integer, 2}}
+                  ]}}}
+    end
+
+    test "double negation" do
+      assert EctoQueryParser.parse("NOT NOT a == 1") ==
+               {:ok, {:not, {:not, {:op, :==, {:identifier, "a"}, {:integer, 1}}}}}
+    end
+
+    test "NOT binds tighter than AND" do
+      assert EctoQueryParser.parse("NOT a == 1 AND b == 2") ==
+               {:ok,
+                {:and,
+                 [
+                   {:not, {:op, :==, {:identifier, "a"}, {:integer, 1}}},
+                   {:op, :==, {:identifier, "b"}, {:integer, 2}}
+                 ]}}
+    end
+
+    test "NOT binds tighter than OR" do
+      assert EctoQueryParser.parse("NOT a == 1 OR b == 2") ==
+               {:ok,
+                {:or,
+                 [
+                   {:not, {:op, :==, {:identifier, "a"}, {:integer, 1}}},
+                   {:op, :==, {:identifier, "b"}, {:integer, 2}}
+                 ]}}
+    end
+
+    test "NOT applies to a whole BETWEEN unit" do
+      assert EctoQueryParser.parse("NOT age BETWEEN 1 AND 10") ==
+               {:ok, {:not, {:between, {:identifier, "age"}, {:integer, 1}, {:integer, 10}}}}
+    end
+
+    test "does not confuse notes identifier with NOT" do
+      assert EctoQueryParser.parse("notes == 1") ==
+               {:ok, {:op, :==, {:identifier, "notes"}, {:integer, 1}}}
+    end
+
+    test "does not confuse not_flag identifier with NOT" do
+      assert EctoQueryParser.parse("not_flag == true") ==
+               {:ok, {:op, :==, {:identifier, "not_flag"}, {:boolean, true}}}
+    end
+  end
+
+  describe "IS NULL / IS NOT NULL" do
+    test "IS NULL on identifier" do
+      assert EctoQueryParser.parse("name IS NULL") ==
+               {:ok, {:is_null, {:identifier, "name"}}}
+    end
+
+    test "lowercase is null" do
+      assert EctoQueryParser.parse("name is null") ==
+               {:ok, {:is_null, {:identifier, "name"}}}
+    end
+
+    test "IS NOT NULL on identifier" do
+      assert EctoQueryParser.parse("name IS NOT NULL") ==
+               {:ok, {:is_not_null, {:identifier, "name"}}}
+    end
+
+    test "lowercase is not null" do
+      assert EctoQueryParser.parse("name is not null") ==
+               {:ok, {:is_not_null, {:identifier, "name"}}}
+    end
+
+    test "IS NULL on dotted identifier" do
+      assert EctoQueryParser.parse("author.name IS NULL") ==
+               {:ok, {:is_null, {:identifier, "author.name"}}}
+    end
+
+    test "IS NULL on function expression" do
+      assert EctoQueryParser.parse("TRIM(name) IS NULL") ==
+               {:ok, {:is_null, {:function, "trim", [{:identifier, "name"}]}}}
+    end
+
+    test "combined with AND" do
+      assert EctoQueryParser.parse("name IS NULL AND age >= 18") ==
+               {:ok,
+                {:and,
+                 [
+                   {:is_null, {:identifier, "name"}},
+                   {:op, :>=, {:identifier, "age"}, {:integer, 18}}
+                 ]}}
+    end
+
+    test "does not confuse island identifier with IS" do
+      assert EctoQueryParser.parse("island == 1") ==
+               {:ok, {:op, :==, {:identifier, "island"}, {:integer, 1}}}
+    end
+
+    test "does not confuse nullable identifier with NULL" do
+      assert EctoQueryParser.parse("nullable == true") ==
+               {:ok, {:op, :==, {:identifier, "nullable"}, {:boolean, true}}}
+    end
+  end
+
+  describe "BETWEEN" do
+    test "integer bounds" do
+      assert EctoQueryParser.parse("age BETWEEN 1 AND 10") ==
+               {:ok, {:between, {:identifier, "age"}, {:integer, 1}, {:integer, 10}}}
+    end
+
+    test "lowercase between and and" do
+      assert EctoQueryParser.parse("age between 1 and 10") ==
+               {:ok, {:between, {:identifier, "age"}, {:integer, 1}, {:integer, 10}}}
+    end
+
+    test "string bounds" do
+      assert EctoQueryParser.parse(~s{performed_on BETWEEN "2026-01-01" AND "2026-02-01"}) ==
+               {:ok,
+                {:between, {:identifier, "performed_on"}, {:string, "2026-01-01"},
+                 {:string, "2026-02-01"}}}
+    end
+
+    test "inner AND binds to BETWEEN, not the logical connector" do
+      assert EctoQueryParser.parse(~s{age BETWEEN 1 AND 10 AND name == "x"}) ==
+               {:ok,
+                {:and,
+                 [
+                   {:between, {:identifier, "age"}, {:integer, 1}, {:integer, 10}},
+                   {:op, :==, {:identifier, "name"}, {:string, "x"}}
+                 ]}}
+    end
+
+    test "inside parentheses" do
+      assert EctoQueryParser.parse("(age BETWEEN 1 AND 10) OR active == true") ==
+               {:ok,
+                {:or,
+                 [
+                   {:between, {:identifier, "age"}, {:integer, 1}, {:integer, 10}},
+                   {:op, :==, {:identifier, "active"}, {:boolean, true}}
+                 ]}}
+    end
+
+    test "dotted identifier target" do
+      assert EctoQueryParser.parse("author.age BETWEEN 1 AND 10") ==
+               {:ok, {:between, {:identifier, "author.age"}, {:integer, 1}, {:integer, 10}}}
+    end
+
+    test "does not confuse between_val identifier with BETWEEN" do
+      assert EctoQueryParser.parse("between_val == 1") ==
+               {:ok, {:op, :==, {:identifier, "between_val"}, {:integer, 1}}}
+    end
+  end
+
   describe "operator includes" do
     test "lowercase includes" do
       assert EctoQueryParser.parse(~s{tags includes "elixir"}) ==
@@ -766,41 +1005,102 @@ defmodule EctoQueryParserTest do
   end
 
   describe "error cases" do
-    test "returns error for empty input" do
-      assert {:error, _} = EctoQueryParser.parse("")
+    alias EctoQueryParser.ParseError
+
+    test "returns ParseError for empty input" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("")
     end
 
-    test "returns error for unterminated string" do
-      assert {:error, _} = EctoQueryParser.parse(~s{"unterminated})
+    test "returns ParseError for unterminated string" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse(~s{"unterminated})
     end
 
-    test "returns error for unmatched bracket" do
-      assert {:error, _} = EctoQueryParser.parse("[1, 2")
+    test "returns ParseError for unmatched bracket" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("[1, 2")
     end
 
-    test "returns error for unmatched paren" do
-      assert {:error, _} = EctoQueryParser.parse("func(1, 2")
+    test "returns ParseError for unmatched paren" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("func(1, 2")
     end
 
-    test "returns error for trailing content" do
-      assert {:error, _} = EctoQueryParser.parse("42 extra")
+    test "returns ParseError for trailing content" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("42 extra")
     end
 
-    test "returns error for identifier starting with digit" do
+    test "returns ParseError for identifier starting with digit" do
       # "1abc" would parse "1" as integer, then fail on "abc" trailing
-      assert {:error, _} = EctoQueryParser.parse("1abc")
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("1abc")
     end
 
-    test "returns error for unclosed grouping paren" do
-      assert {:error, _} = EctoQueryParser.parse("(a == 1 AND b == 2")
+    test "returns ParseError for unclosed grouping paren" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("(a == 1 AND b == 2")
     end
 
-    test "returns error for dangling AND" do
-      assert {:error, _} = EctoQueryParser.parse("a == 1 AND")
+    test "returns ParseError for dangling AND" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("a == 1 AND")
     end
 
-    test "returns error for dangling OR" do
-      assert {:error, _} = EctoQueryParser.parse("a == 1 OR")
+    test "returns ParseError for dangling OR" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("a == 1 OR")
+    end
+
+    test "returns ParseError for dangling BETWEEN" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("age BETWEEN 1")
+    end
+
+    test "returns ParseError for dangling IS" do
+      assert {:error, %ParseError{}} = EctoQueryParser.parse("name IS")
+    end
+  end
+
+  describe "parse error positions" do
+    alias EctoQueryParser.ParseError
+
+    test "reports position of trailing content" do
+      assert {:error, %ParseError{} = err} = EctoQueryParser.parse("a == 1 AND")
+      assert err.line == 1
+      assert err.column == 8
+      assert err.byte_offset == 7
+      assert err.rest == "AND"
+      assert err.message =~ "end of string"
+    end
+
+    test "empty input positions at line 1, column 1" do
+      assert {:error, %ParseError{} = err} = EctoQueryParser.parse("")
+      assert err.line == 1
+      assert err.column == 1
+      assert err.byte_offset == 0
+      assert err.rest == ""
+    end
+
+    test "line advances across newlines" do
+      assert {:error, %ParseError{} = err} = EctoQueryParser.parse("a == 1\nAND")
+      assert err.line == 2
+      assert err.column == 1
+      assert err.byte_offset == 7
+    end
+
+    test "rest is truncated for long unconsumed input" do
+      garbage = "! " <> String.duplicate("x", 500)
+      assert {:error, %ParseError{} = err} = EctoQueryParser.parse("a == 1 " <> garbage)
+      assert String.length(err.rest) <= 63
+      assert String.ends_with?(err.rest, "...")
+    end
+
+    test "Exception.message/1 includes position" do
+      assert {:error, %ParseError{} = err} = EctoQueryParser.parse("a == 1 AND")
+      message = Exception.message(err)
+      assert message =~ "line 1"
+      assert message =~ "column 8"
+      assert message =~ "end of string"
+    end
+
+    test "ParseError is raisable" do
+      assert {:error, %ParseError{} = err} = EctoQueryParser.parse("a == 1 AND")
+
+      assert_raise ParseError, ~r/line 1, column 8/, fn ->
+        raise err
+      end
     end
   end
 end

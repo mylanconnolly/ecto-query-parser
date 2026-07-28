@@ -118,6 +118,68 @@ defmodule EctoQueryParser.Builder do
     end
   end
 
+  defp to_dynamic({:op, :>, left, right}, opts) do
+    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
+      {:ok, dynamic([row], ^l > ^r), lj ++ rj}
+    end
+  end
+
+  defp to_dynamic({:op, :<, left, right}, opts) do
+    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
+      {:ok, dynamic([row], ^l < ^r), lj ++ rj}
+    end
+  end
+
+  # NOT: unary logical negation of any inner condition
+  defp to_dynamic({:not, inner}, opts) do
+    with {:ok, d, joins} <- to_dynamic(inner, opts) do
+      {:ok, dynamic([row], not (^d)), joins}
+    end
+  end
+
+  # IS NULL / IS NOT NULL
+  defp to_dynamic({:is_null, expr}, opts) do
+    with {:ok, e, joins} <- to_expr(expr, opts) do
+      {:ok, dynamic([row], is_nil(^e)), joins}
+    end
+  end
+
+  defp to_dynamic({:is_not_null, expr}, opts) do
+    with {:ok, e, joins} <- to_expr(expr, opts) do
+      {:ok, dynamic([row], not is_nil(^e)), joins}
+    end
+  end
+
+  # IN: membership in a list literal, coercing elements to the field's type
+  defp to_dynamic({:op, :in, left, {:list, _} = right}, opts) do
+    element_target =
+      case field_type(left, opts) do
+        nil -> nil
+        type -> {:array, type}
+      end
+
+    with {:ok, l, lj} <- to_expr(left, opts),
+         {:ok, r, rj} <- to_expr_coerced(right, element_target, opts) do
+      {:ok, dynamic([row], ^l in ^r), lj ++ rj}
+    end
+  end
+
+  defp to_dynamic({:op, :in, _left, right}, _opts) do
+    {:error, "IN operator requires a list value, got: #{inspect(right)}"}
+  end
+
+  # BETWEEN: field >= low AND field <= high, coercing both bounds to the
+  # target's type the same way == does.
+  defp to_dynamic({:between, target, low, high}, opts) do
+    target_type = field_type(target, opts)
+
+    with {:ok, t, tj} <- to_expr(target, opts),
+         {:ok, lo, loj} <- to_expr_coerced(low, target_type, opts),
+         {:ok, hi, hij} <- to_expr_coerced(high, target_type, opts) do
+      {:ok, dynamic([row], ^t >= ^lo and ^t <= ^hi), tj ++ loj ++ hij}
+    end
+  end
+
   # contains: case-insensitive substring match
   defp to_dynamic({:op, :contains, left, {:string, val}}, opts) do
     with {:ok, l, joins} <- to_expr(left, opts) do
@@ -271,24 +333,41 @@ defmodule EctoQueryParser.Builder do
 
   # --- Dotted identifier resolution ---
 
+  # SECURITY: dotted identifiers come from untrusted input, so no code path
+  # here may create atoms. Allowlist checks compare strings, segment lookups
+  # go through `String.to_existing_atom/1`, and JSON path segments stay
+  # strings all the way into the `json_extract_path/2` call.
   defp resolve_dotted_identifier(name, opts) do
-    dotted_atom = String.to_atom(name)
-
-    with :ok <- check_allowed_field(dotted_atom, opts) do
-      first_segment = name |> String.split(".", parts: 2) |> hd() |> String.to_atom()
+    with :ok <- check_allowed_field(name, opts) do
+      first_segment_str = name |> String.split(".", parts: 2) |> hd()
 
       case Keyword.fetch(opts, :schema) do
         {:ok, schema} ->
-          if is_json_field?(schema, first_segment) do
-            cast_type = get_field_type(dotted_atom, opts)
-            resolve_json_path(name, cast_type, opts)
-          else
-            EctoQueryParser.JoinResolver.resolve(name, schema)
+          case existing_atom(first_segment_str) do
+            {:ok, first_segment} ->
+              if is_json_field?(schema, first_segment) do
+                resolve_json_path(first_segment, name, dotted_cast_type(name, opts))
+              else
+                EctoQueryParser.JoinResolver.resolve(name, schema)
+              end
+
+            :error ->
+              {:error, "unknown association: #{first_segment_str} on #{inspect(schema)}"}
           end
 
         :error ->
-          resolve_dotted_from_allowed_fields(name, first_segment, dotted_atom, opts)
+          resolve_dotted_from_allowed_fields(name, first_segment_str, opts)
       end
+    end
+  end
+
+  # Cast type for a dotted path from the keyword form of allowed_fields
+  # (e.g. `"metadata.count": :integer`). If the dotted atom does not already
+  # exist it cannot be an allowed_fields key, so there is no type to find.
+  defp dotted_cast_type(name, opts) do
+    case existing_atom(name) do
+      {:ok, atom} -> get_field_type(atom, opts)
+      :error -> nil
     end
   end
 
@@ -372,17 +451,20 @@ defmodule EctoQueryParser.Builder do
     ArgumentError -> {:error, "unknown field: #{name}"}
   end
 
-  defp check_allowed_field(atom, opts) do
+  # Allowlist checks compare the untrusted name against the (developer
+  # supplied) allowed_fields keys as *strings*, so hostile input never
+  # creates atoms.
+  defp check_allowed_field(atom, opts) when is_atom(atom) do
+    check_allowed_field(Atom.to_string(atom), opts)
+  end
+
+  defp check_allowed_field(name, opts) when is_binary(name) do
     case Keyword.fetch(opts, :allowed_fields) do
       {:ok, allowed} when is_list(allowed) ->
-        if Keyword.keyword?(allowed) do
-          cond do
-            Keyword.has_key?(allowed, atom) -> :ok
-            check_nested_field(atom, allowed) == :ok -> :ok
-            true -> {:error, "field not allowed: #{atom}"}
-          end
+        if allowed_name?(name, allowed) do
+          :ok
         else
-          if atom in allowed, do: :ok, else: {:error, "field not allowed: #{atom}"}
+          {:error, "field not allowed: #{name}"}
         end
 
       :error ->
@@ -390,29 +472,44 @@ defmodule EctoQueryParser.Builder do
     end
   end
 
-  defp check_nested_field(atom, fields) do
-    name = Atom.to_string(atom)
+  defp allowed_name?(name, allowed) do
+    if Keyword.keyword?(allowed) do
+      has_string_key?(allowed, name) or nested_field_allowed?(name, allowed)
+    else
+      Enum.any?(allowed, &(Atom.to_string(&1) == name))
+    end
+  end
 
+  defp has_string_key?(fields, name) do
+    Enum.any?(fields, fn {key, _} -> Atom.to_string(key) == name end)
+  end
+
+  defp string_keyword_get(fields, name) do
+    Enum.find_value(fields, fn {key, value} ->
+      if Atom.to_string(key) == name, do: {:ok, value}
+    end)
+  end
+
+  defp nested_field_allowed?(name, fields) do
     case String.split(name, ".", parts: 2) do
       [first, rest] ->
-        first_atom = String.to_atom(first)
-        value = Keyword.get(fields, first_atom)
+        case string_keyword_get(fields, first) do
+          {:ok, value} ->
+            if singular_assoc?(value) do
+              nested_fields = Keyword.get(assoc_opts(value), :fields, [])
 
-        if singular_assoc?(value) do
-          nested_fields = Keyword.get(assoc_opts(value), :fields, [])
-          rest_atom = String.to_atom(rest)
+              nested_fields == [] or has_string_key?(nested_fields, rest) or
+                nested_field_allowed?(rest, nested_fields)
+            else
+              false
+            end
 
-          if nested_fields == [] or Keyword.has_key?(nested_fields, rest_atom) do
-            :ok
-          else
-            check_nested_field(rest_atom, nested_fields)
-          end
-        else
-          {:error, "field not allowed: #{name}"}
+          nil ->
+            false
         end
 
       _ ->
-        {:error, "field not allowed: #{name}"}
+        false
     end
   end
 
@@ -426,13 +523,17 @@ defmodule EctoQueryParser.Builder do
     end
   end
 
-  defp resolve_dotted_from_allowed_fields(name, first_segment, dotted_atom, opts) do
-    value = get_field_type(first_segment, opts)
+  defp resolve_dotted_from_allowed_fields(name, first_segment_str, opts) do
+    value =
+      case existing_atom(first_segment_str) do
+        {:ok, atom} -> get_field_type(atom, opts)
+        :error -> nil
+      end
 
     cond do
       value == :map ->
-        cast_type = get_field_type(dotted_atom, opts)
-        resolve_json_path(name, cast_type, opts)
+        {:ok, column_atom} = existing_atom(first_segment_str)
+        resolve_json_path(column_atom, name, dotted_cast_type(name, opts))
 
       singular_assoc?(value) ->
         resolve_schemaless_join(name, opts)
@@ -440,28 +541,25 @@ defmodule EctoQueryParser.Builder do
       value == nil ->
         {:error,
          "cannot resolve dotted identifier #{name}: " <>
-           "no schema available and #{first_segment} is not defined in allowed_fields"}
+           "no schema available and #{first_segment_str} is not defined in allowed_fields"}
 
       true ->
         {:error,
          "cannot resolve dotted identifier #{name}: " <>
-           "#{first_segment} is not an association or map field"}
+           "#{first_segment_str} is not an association or map field"}
     end
   end
 
   defp resolve_schemaless_join(name, opts) do
     segments = String.split(name, ".")
     assoc_segments = Enum.slice(segments, 0..-2//1)
-    field_name = List.last(segments) |> String.to_atom()
     allowed_fields = Keyword.get(opts, :allowed_fields, [])
 
-    case walk_schemaless_assocs(assoc_segments, allowed_fields, :root, [], []) do
-      {:ok, joins, final_binding} ->
-        expr = dynamic([{^final_binding, x}], field(x, ^field_name))
-        {:ok, expr, joins}
-
-      {:error, _} = error ->
-        error
+    with {:ok, field_name} <- safe_to_atom(List.last(segments)),
+         {:ok, joins, final_binding} <-
+           walk_schemaless_assocs(assoc_segments, allowed_fields, :root, [], []) do
+      expr = dynamic([{^final_binding, x}], field(x, ^field_name))
+      {:ok, expr, joins}
     end
   end
 
@@ -469,13 +567,19 @@ defmodule EctoQueryParser.Builder do
     do: {:ok, Enum.reverse(joins), binding}
 
   defp walk_schemaless_assocs([segment | rest], fields, parent, path, joins) do
-    assoc_atom = String.to_atom(segment)
-    value = Keyword.get(fields, assoc_atom)
+    value =
+      case existing_atom(segment) do
+        {:ok, assoc_atom} -> Keyword.get(fields, assoc_atom)
+        :error -> nil
+      end
 
     cond do
       singular_assoc?(value) ->
         assoc_opts = assoc_opts(value)
         new_path = path ++ [segment]
+        # Safe: every segment in the path has been validated against the
+        # developer-supplied allowed_fields spec, so the binding atom space
+        # is bounded by the configured association graph.
         binding = new_path |> Enum.join("__") |> String.to_atom()
 
         join_spec = %{
@@ -502,9 +606,11 @@ defmodule EctoQueryParser.Builder do
     schema.__schema__(:type, field_atom) == :map
   end
 
-  defp resolve_json_path(name, cast_type, _opts) do
-    [column | path] = String.split(name, ".")
-    column_atom = String.to_atom(column)
+  # The column is an already-validated existing atom; the JSON path segments
+  # stay plain strings — `json_extract_path/2` takes strings, so untrusted
+  # path keys never touch the atom table.
+  defp resolve_json_path(column_atom, name, cast_type) do
+    [_column | path] = String.split(name, ".")
     json_expr = dynamic([row], json_extract_path(field(row, ^column_atom), ^path))
 
     case cast_type do
@@ -556,9 +662,13 @@ defmodule EctoQueryParser.Builder do
   defp coercion_type({:float, _}, type), do: type
   defp coercion_type({:boolean, _}, type), do: type
 
-  defp coercion_type({:list, _}, {:array, inner})
-       when not is_nil(inner) and inner != :string,
-       do: {:array, inner}
+  defp coercion_type({:list, items}, {:array, inner}) when not is_nil(inner) do
+    if Enum.all?(items, &(coercion_type(&1, inner) == nil)) do
+      nil
+    else
+      {:array, inner}
+    end
+  end
 
   defp coercion_type(_, _), do: nil
 

@@ -30,16 +30,10 @@ defmodule EctoQueryParser.JoinResolver do
     assoc_segments = Enum.slice(segments, 0..-2//1)
     field_name = List.last(segments)
 
-    case walk_associations(assoc_segments, schema, :root, [], []) do
-      {:ok, joins, final_binding} ->
-        field_atom = String.to_atom(field_name)
-        binding_atom = final_binding
-
-        expr = dynamic([{^binding_atom, x}], field(x, ^field_atom))
-        {:ok, expr, joins}
-
-      {:error, _} = error ->
-        error
+    with {:ok, joins, final_binding} <- walk_associations(assoc_segments, schema, :root, [], []),
+         {:ok, field_atom} <- existing_atom(field_name, "unknown field: #{field_name}") do
+      expr = dynamic([{^final_binding, x}], field(x, ^field_atom))
+      {:ok, expr, joins}
     end
   end
 
@@ -48,20 +42,30 @@ defmodule EctoQueryParser.JoinResolver do
   end
 
   defp walk_associations([segment | rest], schema, parent, path, joins) do
-    assoc_atom = String.to_atom(segment)
+    with {:ok, assoc_atom} <-
+           existing_atom(segment, "unknown association: #{segment} on #{inspect(schema)}"),
+         assoc when not is_nil(assoc) <- schema.__schema__(:association, assoc_atom) do
+      new_path = path ++ [segment]
+      # Safe: every segment in the path has been validated as a real
+      # association above, so the binding atom space is bounded by the
+      # schema's association graph.
+      binding = new_path |> Enum.join("__") |> String.to_atom()
 
-    case schema.__schema__(:association, assoc_atom) do
-      nil ->
-        {:error, "unknown association: #{segment} on #{inspect(schema)}"}
+      join_spec = %{binding: binding, assoc: assoc_atom, parent: parent}
+      next_schema = assoc.queryable
 
-      assoc ->
-        new_path = path ++ [segment]
-        binding = new_path |> Enum.join("__") |> String.to_atom()
-
-        join_spec = %{binding: binding, assoc: assoc_atom, parent: parent}
-        next_schema = assoc.queryable
-
-        walk_associations(rest, next_schema, binding, new_path, [join_spec | joins])
+      walk_associations(rest, next_schema, binding, new_path, [join_spec | joins])
+    else
+      nil -> {:error, "unknown association: #{segment} on #{inspect(schema)}"}
+      {:error, _} = error -> error
     end
+  end
+
+  # SECURITY: never create atoms from untrusted identifier segments — an
+  # unknown name means an unknown association/field, not a new atom.
+  defp existing_atom(name, error_message) do
+    {:ok, String.to_existing_atom(name)}
+  rescue
+    ArgumentError -> {:error, error_message}
   end
 end

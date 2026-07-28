@@ -53,6 +53,113 @@ defmodule EctoQueryParser.Integration.QueryExecutionTest do
     test "<= operator" do
       assert run("score <= 9.99") == []
     end
+
+    test "> operator" do
+      assert run("age > 18") == []
+    end
+
+    test "< operator" do
+      assert run("score < 9.99") == []
+    end
+
+    test "> with date coercion" do
+      assert run(~s{performed_on > "2026-05-20"}) == []
+    end
+
+    test "< with date coercion" do
+      assert run(~s{performed_on < "2026-05-20"}) == []
+    end
+  end
+
+  # -- NOT / IS NULL / IN / BETWEEN --
+
+  describe "NOT operator" do
+    test "NOT before comparison" do
+      assert run(~s{NOT name == "alice"}) == []
+    end
+
+    test "NOT before grouped expression" do
+      assert run(~s{NOT (role == "admin" OR role == "mod")}) == []
+    end
+
+    test "NOT combined with AND" do
+      assert run(~s{NOT active == true AND age >= 18}) == []
+    end
+
+    test "NOT on plural association (NOT EXISTS)" do
+      {:ok, query} =
+        EctoQueryParser.apply(EctoQueryParser.Test.Author, ~s{NOT posts.name == "x"})
+
+      assert TestRepo.all(query) == []
+    end
+  end
+
+  describe "IS NULL / IS NOT NULL" do
+    test "IS NULL on plain field" do
+      assert run("name IS NULL") == []
+    end
+
+    test "IS NOT NULL on plain field" do
+      assert run("name IS NOT NULL") == []
+    end
+
+    test "IS NULL on association path" do
+      assert run("author.name IS NULL") == []
+    end
+
+    test "IS NULL on function expression" do
+      assert run("TRIM(name) IS NULL") == []
+    end
+
+    test "IS NULL inside EXISTS on plural association" do
+      {:ok, query} =
+        EctoQueryParser.apply(EctoQueryParser.Test.Author, "posts.name IS NULL")
+
+      assert TestRepo.all(query) == []
+    end
+  end
+
+  describe "IN operator" do
+    test "integer list membership" do
+      assert run("age IN [18, 21, 65]") == []
+    end
+
+    test "string list membership" do
+      assert run(~s{status in ["a", "b"]}) == []
+    end
+
+    test "date list membership with coercion" do
+      assert run(~s{performed_on IN ["2026-05-20", "2026-05-21"]}) == []
+    end
+
+    test "IN on association path" do
+      assert run(~s{author.name IN ["alice", "bob"]}) == []
+    end
+  end
+
+  describe "BETWEEN operator" do
+    test "integer bounds" do
+      assert run("age BETWEEN 18 AND 65") == []
+    end
+
+    test "date bounds with coercion" do
+      assert run(~s{performed_on BETWEEN "2026-01-01" AND "2026-12-31"}) == []
+    end
+
+    test "BETWEEN on association path" do
+      assert run(~s{author.hired_on BETWEEN "2026-01-01" AND "2026-12-31"}) == []
+    end
+
+    test "BETWEEN combined with logical AND" do
+      assert run(~s{age BETWEEN 18 AND 65 AND active == true}) == []
+    end
+
+    test "BETWEEN inside EXISTS on plural association" do
+      {:ok, query} =
+        EctoQueryParser.apply(EctoQueryParser.Test.Author, "posts.age BETWEEN 1 AND 5")
+
+      assert TestRepo.all(query) == []
+    end
   end
 
   # -- Text operators --

@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.4.0
+
+### Security
+
+- **Fixed an atom-exhaustion vulnerability in dotted-identifier resolution.**
+  `resolve_dotted_identifier/2` and the JSON-path resolver called
+  `String.to_atom/1` on raw input *before* any allowlist check, so a hostile
+  stream of unique dotted identifiers (`a.b1 == 1`, `a.b2 == 1`, …) could
+  grow the BEAM atom table without bound and crash the node. Since this
+  library's entire purpose is filtering by untrusted input, treat this as a
+  mandatory upgrade. No code path converts input to atoms anymore:
+  - Allowlist (`:allowed_fields`) checks now compare strings.
+  - Association segments and leaf fields resolve via
+    `String.to_existing_atom/1`; unknown names return the usual
+    `"unknown field: ..."` / `"unknown association: ..."` errors.
+  - JSON path segments stay plain strings all the way into
+    `json_extract_path/2` — they never touch the atom table.
+  - Regression tests assert the atom count stays flat under hostile input.
+
+### Changed (BREAKING)
+
+- **Parse failures now return `{:error, %EctoQueryParser.ParseError{}}`
+  instead of `{:error, binary}`.** The struct is an `Exception` carrying
+  `message`, `line` (1-based), `column` (1-based), `byte_offset`, and `rest`
+  (the unconsumed input, truncated) — enough to power editor diagnostics.
+  `Exception.message/1` renders a one-liner including the position. This
+  applies to `EctoQueryParser.parse/1` and propagates through
+  `EctoQueryParser.apply/3`. Code matching `{:error, reason} when
+  is_binary(reason)` on *parse* failures must be updated; builder/validation
+  errors (unknown field, field not allowed, unknown function, …) keep their
+  `{:error, binary}` shape, since no source position is known at that stage.
+
+### Added
+
+- Strict comparison operators `>` and `<` (with the same literal type
+  coercion as `>=` / `<=`).
+- `NOT` — unary logical negation: `NOT expr`, `NOT (a OR b)`. Precedence is
+  `NOT` > `AND` > `OR`. Accepts `NOT` / `not`, like the other keywords.
+  Negating a plural-association predicate now produces `NOT EXISTS`,
+  lifting the v0.3.0 limitation ("posts with no matching comments" works).
+- `IS NULL` / `IS NOT NULL` — postfix on identifiers, association paths,
+  JSON paths, and function expressions; compiles to `is_nil/1` /
+  `not is_nil/1`.
+- `IN` — list membership: `age IN [18, 21]`, `status in ["a", "b"]`. List
+  elements are type-coerced against the field's type the same way `==`
+  coerces its literal.
+- `BETWEEN` — `field BETWEEN low AND high` compiles to
+  `field >= low and field <= high`, with both bounds coerced to the field's
+  type. The inner `AND` binds to `BETWEEN`, not the logical connector.
+- All new operators work on plain fields, association paths (respecting the
+  JOIN vs EXISTS split for plural associations), and inside parentheses.
+- Parse-failure messages are now labeled and concise instead of
+  NimbleParsec's exhaustive expected-token dump.
+
 ## v0.3.1
 
 ### Fixed

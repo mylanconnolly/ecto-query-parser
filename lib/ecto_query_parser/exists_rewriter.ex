@@ -30,7 +30,46 @@ defmodule EctoQueryParser.ExistsRewriter do
 
   defp do_rewrite({:and, items}, opts), do: rewrite_combinator(:and, items, opts)
   defp do_rewrite({:or, items}, opts), do: rewrite_combinator(:or, items, opts)
+
+  defp do_rewrite({:not, inner}, opts) do
+    with {:ok, rewritten} <- do_rewrite(inner, opts) do
+      {:ok, {:not, rewritten}}
+    end
+  end
+
   defp do_rewrite({:op, _, _, _} = leaf, opts), do: wrap_leaf(leaf, opts)
+
+  defp do_rewrite({tag, expr} = leaf, opts) when tag in [:is_null, :is_not_null] do
+    case classify_operand(expr, opts) do
+      {:ok, :singular} ->
+        {:ok, leaf}
+
+      {:ok, {:plural, binding, kind, aopts, sub_opts}} ->
+        {:ok, {:exists, binding, kind, aopts, {tag, strip_first_segment(expr)}, sub_opts}}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp do_rewrite({:between, target, low, high} = leaf, opts) do
+    with {:ok, target_class} <- classify_operand(target, opts),
+         {:ok, low_class} <- classify_operand(low, opts),
+         {:ok, high_class} <- classify_operand(high, opts) do
+      case {target_class, low_class, high_class} do
+        {:singular, :singular, :singular} ->
+          {:ok, leaf}
+
+        {{:plural, binding, kind, aopts, sub_opts}, :singular, :singular} ->
+          inner = {:between, strip_first_segment(target), low, high}
+          {:ok, {:exists, binding, kind, aopts, inner, sub_opts}}
+
+        _ ->
+          {:error, "BETWEEN bounds referencing a plural association are not supported"}
+      end
+    end
+  end
+
   defp do_rewrite(other, _opts), do: {:ok, other}
 
   defp rewrite_combinator(combinator, items, opts) do

@@ -106,7 +106,9 @@ defmodule EctoQueryParser do
   of a dotted path. `comments.author.name` is allowed; `author.comments.body`
   returns an error.
 
-  Returns `{:ok, query}` or `{:error, reason}`.
+  Returns `{:ok, query}` or `{:error, reason}`. Parse failures return
+  `{:error, %EctoQueryParser.ParseError{}}` (with line/column position
+  information); builder and validation errors return `{:error, binary}`.
   """
   def apply(queryable, query_string, opts \\ []) do
     schema = extract_schema(queryable)
