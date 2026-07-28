@@ -2,7 +2,91 @@
 
 ## v0.5.0
 
-### Added
+One release, two headline features: `{{name}}` **parameters** (with
+`[[optional]]` groups and the `literal_transform:` hook) for the existing
+filter API, and the full **pipe language** — the staged query language from
+`docs/pipe-language.md` (source + `filter`/`select`/`group`/`sort`/`limit`/
+`offset` stages, staged compilation, `@slug` external references, positioned
+validation errors). The pipe language was originally slated for v0.6.0 and
+was folded into this unpublished release instead of shipping two releases in
+one day.
+
+### Added — the pipe language
+
+- **`EctoQueryParser.parse_pipe/1` and `EctoQueryParser.build_pipe/2`** —
+  parse and compile staged pipe queries:
+
+  ```
+  orders
+  | filter status == "paid" AND created_at >= "last month"
+  | group customer.region { total = sum(amount), n = count() }
+  | sort -total
+  | limit 10
+  ```
+
+  A query is a source plus `|`-separated stages (whitespace/newlines around
+  `|` insignificant; a bare source is valid). `parse_pipe/1` returns an
+  `%EctoQueryParser.Pipe.Query{}` exposing the `:source` so callers can
+  validate the referenced table against their catalog before building;
+  `build_pipe/2` accepts the text or the parsed struct plus the existing
+  `allowed_fields:` / `params:` / `literal_transform:` options and the new
+  `resolve_source:`.
+- **Stages.**
+  - `filter <expr>` — the existing filter grammar verbatim (operators,
+    functions, association paths with JOIN/EXISTS, JSONB paths, `{{params}}`,
+    `[[optional]]` groups). Multiple filter stages allowed.
+  - `select col [, col ...]` — identifiers (association paths,
+    singular-only) or `alias = FUNC(...)` with the existing function set;
+    restricts the output shape for later stages.
+  - `group [breakouts] { alias = agg(...), ... }` — breakouts are
+    identifiers, function applications (`ROUND_*` temporal bucketing), or
+    `alias = FUNC(...)`; un-aliased function breakouts get a derived,
+    referenceable name (`round_month_created_at`). Aggregations: `count()`,
+    `count(col)`, `count_distinct(col)`, `sum(col)`, `avg(col)`, `min(col)`,
+    `max(col)` — every aggregation aliased, aliases must not collide with
+    each other or breakout names. `group { ... }` with no breakouts is a
+    single-row summary. Output shape = breakouts then aliases.
+  - `sort key [, key ...]` — `-key` descending; after a `group`, keys refer
+    to the grouped output including aliases. A later sort replaces an
+    earlier one.
+  - `limit N` / `offset N` — non-negative integer literals only, at most one
+    of each; row capping stays the caller's job.
+- **Staged compilation.** Stages fold onto one Ecto query; the first
+  column-referencing stage after a projection (or after `limit`/`offset` on
+  a projected level) wraps the accumulated query in a subquery, so `filter`
+  after `group` is HAVING semantics with no special case. Consecutive
+  same-shape stages share a query level. Output field specs flow stage to
+  stage (breakouts keep the underlying field type, `sum`/`min`/`max` keep
+  their argument's, `count*` are `:integer`), so coercion and
+  `literal_transform:` keep working over grouped output.
+- **Positional output columns (atom safety).** Aliases never become atoms:
+  projections select into the fixed key set `:c0..:c63` (max 64 columns per
+  stage) and `build_pipe/2` returns `{:ok, query, columns}` where `columns`
+  is the ordered `%{name: "total", key: :c1}` rename mapping (`nil` when no
+  projection stage ran). A hostile flood of unique alias/table/slug/column
+  names cannot grow the atom table — covered by regression tests.
+- **`@slug` external references** (`@monthly-revenue`; slugs
+  `[a-z0-9][a-z0-9-_]*`) resolve through the new `resolve_source:` option:
+  `fn slug -> {:ok, queryable, fields} | {:error, message} end`. The
+  queryable is inlined as a subquery source and `fields` (an
+  `allowed_fields`-format spec of its output) validates and types the
+  stages that follow. Missing resolver, resolver errors, and off-contract
+  returns are clear build errors carrying the source's position.
+- **Positioned validation errors** — new `EctoQueryParser.ValidationError`
+  exception struct with `message`, `line`/`column`/`byte_offset`, `stage`,
+  and `stage_index`. Identifiers, aliases, and stage keywords carry source
+  positions through the pipe AST, so unknown columns in
+  `select`/`group`/`sort`, alias collisions, plural associations outside
+  filters, unresolvable `@refs`, and duplicate `limit`/`offset` stages point
+  at the offending token. Boundary: errors arising *inside* a `filter`
+  stage's boolean expression keep the plain `{:error, binary}` shape
+  (prefixed with `"in filter stage N: "`) — the filter grammar's AST carries
+  no per-token positions.
+- **`EctoQueryParser.parameters/1` accepts pipe queries** (text or parsed
+  struct), collecting `{{name}}` parameters across all filter stages with
+  the same `required` semantics.
+
+### Added — parameters and literals
 
 - **`{{name}}` parameters.** Placeholders are valid anywhere a literal may
   appear (right side of comparisons, list elements, function arguments,
@@ -47,6 +131,14 @@
     literal on the left flips the operator first. `{:range, _}` for any
     other operator (IN elements, LIKE, `includes`) is a build error with a
     clear message.
+
+### Changed
+
+- `ROUND_*` functions now inline their `DATE_TRUNC` unit as a SQL literal
+  (`DATE_TRUNC('month', ...)`) instead of binding it as a parameter. The
+  unit comes from a fixed internal map (never from input), and inlining
+  keeps the expression textually identical wherever it repeats — required
+  for grouped SELECT/GROUP BY expressions to match under Postgres.
 
 ### Fixed
 

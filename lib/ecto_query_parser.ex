@@ -158,8 +158,125 @@ defmodule EctoQueryParser do
   end
 
   @doc """
-  Lists the `{{name}}` parameters referenced by a filter string, in order of
-  first appearance.
+  Parses a pipe query string into an `EctoQueryParser.Pipe.Query` struct.
+
+  A pipe query is a source (a table name like `orders` / `sales.orders`, or
+  an external `@slug` reference) followed by zero or more `|`-separated
+  stages:
+
+      orders
+      | filter status == "paid" AND amount >= {{min_amount}}
+      | group customer.region { total = sum(amount), n = count() }
+      | sort -total
+      | limit 10
+
+  Whitespace (including newlines) is insignificant around `|`; a bare source
+  with no stages is a valid query. The `filter` stage embeds the plain
+  filter grammar verbatim, parameters and `[[optional]]` groups included.
+
+  Parsing performs no validation against a schema or field spec — use
+  `build_pipe/2` for that. The returned struct exposes the query's `:source`
+  so callers can validate the referenced table before building.
+
+  Returns `{:ok, %EctoQueryParser.Pipe.Query{}}` or
+  `{:error, %EctoQueryParser.ParseError{}}`.
+  """
+  def parse_pipe(query_string) when is_binary(query_string) do
+    EctoQueryParser.Pipe.Parser.parse(query_string)
+  end
+
+  @doc """
+  Parses and compiles a pipe query into an Ecto query.
+
+  Accepts a pipe query string or an already-parsed
+  `EctoQueryParser.Pipe.Query` struct. Returns `{:ok, query, columns}` or
+  `{:error, reason}`, where `reason` is an `EctoQueryParser.ParseError`
+  (parse failures), an `EctoQueryParser.ValidationError` (stage-level
+  validation failures, positioned when the offending token's location is
+  known), or a plain binary (errors arising inside a `filter` stage's
+  boolean expression, prefixed with the stage that produced them).
+
+  ## Output columns
+
+  Aggregation and select aliases come from untrusted input, so they are
+  never turned into atoms. Instead, every projection stage (`select` /
+  `group`) selects into positional atom keys `:c0`, `:c1`, … (a fixed,
+  compile-time set; at most 64 columns per stage) and `columns` returns the
+  mapping back to the user-facing names, in output order:
+
+      {:ok, query, columns} =
+        EctoQueryParser.build_pipe(
+          "orders | group region { total = sum(amount) } | sort -total")
+
+      columns
+      #=> [%{name: "region", key: :c0}, %{name: "total", key: :c1}]
+
+      Repo.all(query)
+      #=> [%{c0: "north", c1: 1200}, ...]
+
+  Rows come back keyed by the positional atoms; rename them with `columns`.
+  When the pipe has no projection stage (bare source, or filter/sort/limit
+  only), the query keeps the source's own row shape and `columns` is `nil` —
+  note that a schemaless table source then has no select clause at all, so
+  attach one (`query |> select(...)`) before executing.
+
+  ## Sources
+
+  A table source compiles to a schemaless `from` (optionally
+  schema-qualified: `sales.orders` sets the query prefix). The table name is
+  **not** validated — parse first with `parse_pipe/1` and check the struct's
+  `:source` against your catalog, then pass the matching `:allowed_fields`.
+
+  An `@slug` source is resolved through the required `:resolve_source`
+  option:
+
+      resolve_source: fn slug ->
+        case MyApp.Questions.fetch(slug) do
+          {:ok, question} -> {:ok, question.query, question.fields}
+          :error -> {:error, "no such question"}
+        end
+      end
+
+  The resolver receives the slug (without the `@`) and must return
+  `{:ok, queryable, fields}` — the queryable is inlined as a subquery
+  source, and `fields` is its output field spec in the same format as
+  `:allowed_fields` (so stages can be validated and typed against it) — or
+  `{:error, message}`. The queryable must be usable as an Ecto subquery
+  (i.e. carry a select, as any schema-based or previously-built query
+  does). A `@slug` in the text without a `:resolve_source` option is a
+  build error.
+
+  ## Options
+
+    * `:allowed_fields` — field spec for a table source, exactly as in
+      `apply/3` (allowlisting, types for coercion, association tuples for
+      schemaless joins/EXISTS).
+    * `:params` — `{{name}}` parameter bindings for filter stages.
+    * `:literal_transform` — the same hook as in `apply/3`; applies inside
+      filter stages, including filters over grouped output (where breakout
+      columns keep their underlying type and aggregation aliases get the
+      aggregate's type).
+    * `:resolve_source` — resolver for `@slug` sources (see above).
+
+  Row capping remains the caller's job: `limit`/`offset` stages are applied
+  as written, and a caller-enforced hard cap should be applied to the
+  returned query as today.
+  """
+  def build_pipe(query, opts \\ [])
+
+  def build_pipe(query_string, opts) when is_binary(query_string) do
+    with {:ok, pipe} <- parse_pipe(query_string) do
+      build_pipe(pipe, opts)
+    end
+  end
+
+  def build_pipe(%EctoQueryParser.Pipe.Query{} = pipe, opts) do
+    EctoQueryParser.Pipe.Compiler.compile(pipe, opts)
+  end
+
+  @doc """
+  Lists the `{{name}}` parameters referenced by a filter string or a pipe
+  query string, in order of first appearance.
 
   Each entry is `%{name: String.t(), required: boolean()}`. A parameter is
   optional (`required: false`) iff **every** occurrence of its name sits
@@ -168,13 +285,50 @@ defmodule EctoQueryParser do
       iex> EctoQueryParser.parameters("status == {{status}} [[AND created_at >= {{start}}]]")
       {:ok, [%{name: "status", required: true}, %{name: "start", required: false}]}
 
-  Returns `{:error, %EctoQueryParser.ParseError{}}` if the string does not
-  parse.
+  Pipe queries are supported — parameters may appear in any `filter` stage:
+
+      iex> EctoQueryParser.parameters("orders | filter status == {{status}} | limit 5")
+      {:ok, [%{name: "status", required: true}]}
+
+  Also accepts an already-parsed `EctoQueryParser.Pipe.Query`.
+
+  Returns `{:error, %EctoQueryParser.ParseError{}}` if the string parses
+  neither as a filter nor as a pipe query (whichever parse consumed more
+  input provides the error).
   """
   def parameters(query_string) when is_binary(query_string) do
-    with {:ok, ast} <- parse(query_string) do
-      {:ok, EctoQueryParser.Params.list(ast)}
+    case parse(query_string) do
+      {:ok, ast} ->
+        {:ok, EctoQueryParser.Params.list(ast)}
+
+      {:error, filter_error} ->
+        case parse_pipe(query_string) do
+          {:ok, pipe} ->
+            parameters(pipe)
+
+          {:error, pipe_error} ->
+            if pipe_error.byte_offset > filter_error.byte_offset,
+              do: {:error, pipe_error},
+              else: {:error, filter_error}
+        end
     end
+  end
+
+  def parameters(%EctoQueryParser.Pipe.Query{stages: stages}) do
+    entries =
+      for {:filter, ast, _pos} <- stages,
+          entry <- EctoQueryParser.Params.list(ast),
+          do: entry
+
+    params =
+      entries
+      |> Enum.map(& &1.name)
+      |> Enum.uniq()
+      |> Enum.map(fn name ->
+        %{name: name, required: Enum.any?(entries, &(&1.name == name and &1.required))}
+      end)
+
+    {:ok, params}
   end
 
   # Names the source binding so EXISTS subqueries can reference it via
