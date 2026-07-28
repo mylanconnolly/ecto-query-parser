@@ -74,6 +74,85 @@ NOT comments.body contains "spam"
 `NOT` on a plural-association predicate produces a `NOT EXISTS` subquery
 ("posts with no matching comments").
 
+### Parameters
+
+`{{name}}` placeholders may appear anywhere a literal may appear — the right
+side of comparisons, list elements, function arguments, `BETWEEN` bounds.
+Names match `[A-Za-z_][A-Za-z0-9_]*` and whitespace inside the braces is
+tolerated (`{{ status }}`).
+
+Values are bound at build time via the `:params` option:
+
+```elixir
+{:ok, query} =
+  EctoQueryParser.apply(Post, "status == {{status}} AND published_on >= {{start}}",
+    params: %{"status" => "published", "start" => "2026-01-01"}
+  )
+```
+
+Bound values behave exactly like inline literals of that value: they receive
+the same type coercion against the field's type (the `"2026-01-01"` above is
+cast to the `:date` column) and are always bound as prepared-statement
+parameters. Values without a literal syntax (`Date`, `DateTime`, `Decimal`,
+...) can be passed directly. Atom keys are accepted as a convenience
+(`params: %{status: "published"}`).
+
+An unbound parameter — key missing or value `nil` — is a build error:
+
+```elixir
+{:error, "missing required parameter: status"}
+```
+
+...unless every occurrence of it sits inside an optional group (below).
+
+Use `EctoQueryParser.parameters/1` to discover the parameters a filter
+references, in order of first appearance:
+
+```elixir
+EctoQueryParser.parameters("status == {{status}} [[AND created_at >= {{start}}]]")
+#=> {:ok, [%{name: "status", required: true}, %{name: "start", required: false}]}
+```
+
+`required` is `false` iff every occurrence of the name is inside optional
+groups. Parse failures return `{:error, %EctoQueryParser.ParseError{}}`.
+
+### Optional groups
+
+`[[ ... ]]` wraps a boolean fragment that should only apply when its
+parameters are bound — the same convention used by raw-SQL templating
+libraries. The `AND`/`OR` connector lives *inside* the brackets:
+
+```
+status == "live" [[AND created_at >= {{start}}]] [[AND region == {{region}}]]
+```
+
+- If **every** `{{param}}` inside a group is bound (non-`nil`), the group
+  participates exactly as if the brackets weren't there.
+- If **any** is unbound, the entire group is pruned from the query before
+  building — neutral, as if the text were absent.
+- A group containing no parameters is always included.
+
+With `params: %{"start" => "2026-01-01"}` the filter above becomes
+`status == "live" AND created_at >= {{start}}`; with `params: %{}` it becomes
+just `status == "live"`.
+
+Grammar rules:
+
+- A group attaches to the chain at its connector's precedence level, so it
+  must contain a fragment that composes there: `a [[OR b AND c]]` works
+  (`OR` element), while `a [[AND b OR c]]` is a parse error — write
+  `a [[AND (b OR c)]]`.
+- A connector-less group may appear where an expression begins, most
+  usefully as the entire filter: `[[status == {{s}}]]` (optionally followed
+  by further groups: `[[status == {{s}}]] [[AND region == {{r}}]]`). If
+  everything prunes away, the filter degenerates to `WHERE TRUE`.
+- Optional groups do not nest; unmatched or nested brackets are
+  `ParseError`s with position information.
+- Groups compose with the full operator set, including plural-association
+  predicates (a pruned or included group merges into the surrounding
+  `EXISTS` normally) and `NOT` (inside the group; `NOT [[...]]` is a parse
+  error).
+
 ### Functions
 
 Functions are case-insensitive and can be nested.
@@ -286,6 +365,60 @@ target).
 `:join_owner_key` and `:join_related_key` (the join table's FK columns), and
 optionally `:join_prefix` (a schema prefix for the join table).
 
+### Natural-language literals
+
+The `:literal_transform` build option lets you intercept string literals
+(and bound string parameter values) before the built-in type coercion — for
+example to accept human date phrases:
+
+```elixir
+transform = fn
+  :date, "last year" -> {:range, {~D[2025-01-01], ~D[2025-12-31]}}
+  :date, "today"     -> {:ok, Date.utc_today()}
+  _type, _raw        -> :default
+end
+
+{:ok, query} =
+  EctoQueryParser.apply(Post, ~s{published_on == "last year"},
+    literal_transform: transform
+  )
+```
+
+The function is called as `fun.(ecto_type, raw_string)` whenever a string
+literal is resolved against a field with a known Ecto type — on plain
+fields, association-path leaves (the coercion walk already knows the leaf
+type, including inside `EXISTS` subqueries), `BETWEEN` bounds, `IN` list
+elements, `includes`, and `LIKE`/`ILIKE` patterns. It may return:
+
+- `:default` — fall through to the existing behavior (coercion + `type/2`
+  wrapping).
+- `{:ok, term}` — replace the value. The term is bound as a plain
+  prepared-statement parameter with **no** `type/2` wrap; the transform owns
+  the type.
+- `{:range, {lo, hi}}` — the literal denotes an **inclusive** range, which
+  compiles per operator:
+
+  | Operator | Compiles to |
+  |----------|-------------|
+  | `== `    | `field >= lo AND field <= hi` |
+  | `!=`     | `NOT (field >= lo AND field <= hi)` |
+  | `>=`     | `field >= lo` |
+  | `>`      | `field > hi` |
+  | `<=`     | `field <= hi` |
+  | `<`      | `field < lo` |
+  | `BETWEEN a AND b` | each bound resolves independently — `a` uses its `lo`, `b` uses its `hi` |
+
+  A literal on the left side flips the operator first
+  (`"last year" <= field` ≡ `field >= ...`). Range results are only
+  meaningful for comparisons and `BETWEEN`; returning `{:range, _}` for
+  anything else (`IN` elements, `LIKE` patterns, `includes`) is a build
+  error.
+
+The transform is not called when no field type is known (e.g. schemaless
+queries without types in `:allowed_fields`, or function arguments), and it
+is not called for `contains`/`search`, whose strings are treated as match
+words rather than compared values.
+
 ### Error Handling
 
 All errors are returned as `{:error, reason}` tuples.
@@ -311,6 +444,7 @@ known at that stage):
 {:error, "unknown field: nonexistent"}
 {:error, "unknown association: nonexistent"}
 {:error, "unknown function: bogus"}
+{:error, "missing required parameter: start"}
 {:error, "contains operator requires a string or identifier value, got: ..."}
 ```
 
@@ -318,9 +452,9 @@ known at that stage):
 
 The library is designed for untrusted input: identifiers are never converted
 to atoms unless they already exist (so hostile input cannot exhaust the BEAM
-atom table), JSON path segments stay plain strings, and `contains` / `search`
-escape LIKE metacharacters. Combine with `:allowed_fields` to control exactly
-what users can filter on.
+atom table), parameter names stay plain strings, JSON path segments stay
+plain strings, and `contains` / `search` escape LIKE metacharacters. Combine
+with `:allowed_fields` to control exactly what users can filter on.
 
 ## Development
 

@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.5.0
+
+### Added
+
+- **`{{name}}` parameters.** Placeholders are valid anywhere a literal may
+  appear (right side of comparisons, list elements, function arguments,
+  BETWEEN bounds); names match `[A-Za-z_][A-Za-z0-9_]*` and whitespace
+  inside the braces is tolerated. Values bind at build time via the new
+  `params: %{"name" => value}` option on `EctoQueryParser.apply/3` and
+  `Builder.build/2`, and behave exactly like inline literals: same type
+  coercion against the field's type, always bound as prepared-statement
+  parameters. Values without a literal syntax (`Date`, `Decimal`, ...) can
+  be passed directly. An unbound parameter (missing key or `nil`) is a
+  build error: `{:error, "missing required parameter: name"}`. Parameter
+  names stay strings end to end — no atoms.
+- **`[[ ... ]]` optional groups.** A bracketed group carries its `AND`/`OR`
+  connector *inside* the brackets and attaches to the surrounding boolean
+  chain at that connector's precedence level
+  (`status == "x" [[AND created_at >= {{start}}]]`); a connector-less
+  `[[expr]]` may stand as the whole filter (degenerating to `WHERE TRUE`
+  when pruned). If every `{{param}}` in a group is bound, the group
+  participates as if the brackets were absent; if any is unbound, the whole
+  group is pruned before building. Groups with no parameters are always
+  included. Groups do not nest; unmatched or nested brackets are
+  `ParseError`s with positions. Pruning runs after parse and before the
+  EXISTS rewriter, so groups compose with plural-association predicates
+  (merging into the same `EXISTS`) and `NOT`.
+- **`EctoQueryParser.parameters/1`** — parameter discovery. Returns
+  `{:ok, [%{name: "status", required: true}, ...]}` in order of first
+  appearance; `required` is `false` iff every occurrence of the name sits
+  inside optional groups. Parse failures return the usual
+  `{:error, %ParseError{}}`.
+- **`literal_transform:` build option** — a `fun(ecto_type, raw_string)`
+  hook called for string literals (and bound string parameter values)
+  resolved against a typed field, before the built-in coercion — on plain
+  fields, association-path leaves (including inside `EXISTS`), BETWEEN
+  bounds, IN elements, `includes`, and LIKE/ILIKE patterns. Returns:
+  - `:default` — today's behavior (coercion + `type/2` wrap);
+  - `{:ok, term}` — replace the value, bound as a plain pin with no
+    `type/2` wrap (the transform owns the type);
+  - `{:range, {lo, hi}}` — the literal denotes an inclusive range,
+    compiled per operator: `==` → `>= lo AND <= hi`, `!=` → its negation,
+    `>=` → `>= lo`, `>` → `> hi`, `<=` → `<= hi`, `<` → `< lo`; BETWEEN
+    bounds resolve independently (low takes `lo`, high takes `hi`); a
+    literal on the left flips the operator first. `{:range, _}` for any
+    other operator (IN elements, LIKE, `includes`) is a build error with a
+    clear message.
+
+### Fixed
+
+- Building a list containing a non-literal (e.g. an identifier) now returns
+  `{:error, "lists may only contain literal values, ..."}` instead of
+  raising a `FunctionClauseError`.
+
 ## v0.4.0
 
 ### Security

@@ -45,17 +45,35 @@ defmodule EctoQueryParser.Builder do
       If provided, any field not in the list will return an error.
     * `:schema` - the Ecto schema module, needed to resolve dotted identifiers
       (association paths like `author.name`).
+    * `:params` - map of `{{name}}` parameter bindings
+      (`%{"name" => value}`). Optional groups whose parameters are unbound
+      are pruned; any remaining unbound parameter is a build error.
+    * `:literal_transform` - `fun(ecto_type, raw_string)` called for string
+      literals (and bound string parameter values) compared against a typed
+      field, before the built-in coercion. May return `{:ok, term}` (replace
+      the value; the transform owns the type), `{:range, {lo, hi}}` (the
+      literal denotes an inclusive range; only meaningful for comparison and
+      BETWEEN operators), or `:default` (fall through to normal coercion).
 
   Returns `{:ok, dynamic, joins}` or `{:error, reason}`.
   """
   def build(ast, opts \\ []) do
-    to_dynamic(ast, opts)
+    params = Keyword.get(opts, :params, %{})
+
+    with {:ok, pruned} <- EctoQueryParser.Params.prune(ast, params),
+         {:ok, substituted} <- EctoQueryParser.Params.substitute(pruned, params) do
+      to_dynamic(substituted, opts)
+    end
   end
 
   # EXISTS: emitted by EctoQueryParser.ExistsRewriter for has_many /
   # many_to_many references. The inner AST is built against the nested
-  # context (`sub_opts`), then wrapped in a correlated subquery.
+  # context (`sub_opts`), then wrapped in a correlated subquery. Build-time
+  # options that are not tied to the outer context (the literal transform)
+  # follow the recursion inside.
   defp to_dynamic({:exists, _binding, kind, aopts, inner_ast, sub_opts}, opts) do
+    sub_opts = Keyword.merge(sub_opts, Keyword.take(opts, [:literal_transform]))
+
     with {:ok, inner_dynamic, inner_joins} <- to_dynamic(inner_ast, sub_opts) do
       source_binding = Keyword.get(opts, :source_binding, :__eqp_source)
       subq = build_exists_subquery(kind, aopts, inner_dynamic, inner_joins, source_binding)
@@ -93,40 +111,18 @@ defmodule EctoQueryParser.Builder do
     end
   end
 
-  # Comparison operators
-  defp to_dynamic({:op, :==, left, right}, opts) do
-    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
-      {:ok, dynamic([row], ^l == ^r), lj ++ rj}
-    end
-  end
+  # Comparison operators. Each operand resolves either to a plain expression
+  # or — when the :literal_transform option turns a string literal into an
+  # inclusive range — to {:range, lo, hi}, which compiles per operator.
+  @comparison_ops [:==, :!=, :>=, :<=, :>, :<]
 
-  defp to_dynamic({:op, :!=, left, right}, opts) do
-    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
-      {:ok, dynamic([row], ^l != ^r), lj ++ rj}
-    end
-  end
+  defp to_dynamic({:op, op, left, right}, opts) when op in @comparison_ops do
+    left_type = field_type(left, opts)
+    right_type = field_type(right, opts)
 
-  defp to_dynamic({:op, :>=, left, right}, opts) do
-    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
-      {:ok, dynamic([row], ^l >= ^r), lj ++ rj}
-    end
-  end
-
-  defp to_dynamic({:op, :<=, left, right}, opts) do
-    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
-      {:ok, dynamic([row], ^l <= ^r), lj ++ rj}
-    end
-  end
-
-  defp to_dynamic({:op, :>, left, right}, opts) do
-    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
-      {:ok, dynamic([row], ^l > ^r), lj ++ rj}
-    end
-  end
-
-  defp to_dynamic({:op, :<, left, right}, opts) do
-    with {:ok, l, lj, r, rj} <- build_comparison_operands(left, right, opts) do
-      {:ok, dynamic([row], ^l < ^r), lj ++ rj}
+    with {:ok, l, lj} <- resolve_operand(left, right_type, opts),
+         {:ok, r, rj} <- resolve_operand(right, left_type, opts) do
+      compile_comparison(op, l, r, lj ++ rj)
     end
   end
 
@@ -150,16 +146,28 @@ defmodule EctoQueryParser.Builder do
     end
   end
 
-  # IN: membership in a list literal, coercing elements to the field's type
-  defp to_dynamic({:op, :in, left, {:list, _} = right}, opts) do
+  # IN: membership in a list literal, coercing elements to the field's type.
+  # The literal transform runs per string element (against the field's type);
+  # a {:range, _} return is not meaningful here and errors.
+  defp to_dynamic({:op, :in, left, {:list, items} = right}, opts) do
+    element_type = field_type(left, opts)
+
     element_target =
-      case field_type(left, opts) do
+      case element_type do
         nil -> nil
         type -> {:array, type}
       end
 
     with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr_coerced(right, element_target, opts) do
+         {:ok, transformed?, items} <- transform_list_elements(items, element_type, opts),
+         {:ok, r, rj} <-
+           (if transformed? do
+              with {:ok, values} <- literal_values(items) do
+                {:ok, dynamic([row], ^values), []}
+              end
+            else
+              to_expr_coerced(right, element_target, opts)
+            end) do
       {:ok, dynamic([row], ^l in ^r), lj ++ rj}
     end
   end
@@ -169,13 +177,17 @@ defmodule EctoQueryParser.Builder do
   end
 
   # BETWEEN: field >= low AND field <= high, coercing both bounds to the
-  # target's type the same way == does.
+  # target's type the same way == does. When the literal transform turns a
+  # bound into a range, each bound resolves independently: the low bound
+  # takes its range's lo, the high bound takes its range's hi.
   defp to_dynamic({:between, target, low, high}, opts) do
     target_type = field_type(target, opts)
 
     with {:ok, t, tj} <- to_expr(target, opts),
-         {:ok, lo, loj} <- to_expr_coerced(low, target_type, opts),
-         {:ok, hi, hij} <- to_expr_coerced(high, target_type, opts) do
+         {:ok, lo_res, loj} <- resolve_operand(low, target_type, opts),
+         {:ok, hi_res, hij} <- resolve_operand(high, target_type, opts) do
+      lo = between_bound(lo_res, :low)
+      hi = between_bound(hi_res, :high)
       {:ok, dynamic([row], ^t >= ^lo and ^t <= ^hi), tj ++ loj ++ hij}
     end
   end
@@ -199,17 +211,18 @@ defmodule EctoQueryParser.Builder do
     {:error, "contains operator requires a string or identifier value, got: #{inspect(right)}"}
   end
 
-  # like / ilike: pass pattern through directly
+  # like / ilike: pass pattern through directly. The literal transform may
+  # replace the pattern via {:ok, term}; a {:range, _} return errors.
   defp to_dynamic({:op, :like, left, right}, opts) do
     with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+         {:ok, r, rj} <- resolve_pattern(right, left, "LIKE", opts) do
       {:ok, dynamic([row], like(^l, ^r)), lj ++ rj}
     end
   end
 
   defp to_dynamic({:op, :ilike, left, right}, opts) do
     with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr(right, opts) do
+         {:ok, r, rj} <- resolve_pattern(right, left, "ILIKE", opts) do
       {:ok, dynamic([row], ilike(^l, ^r)), lj ++ rj}
     end
   end
@@ -223,7 +236,8 @@ defmodule EctoQueryParser.Builder do
       end
 
     with {:ok, l, lj} <- to_expr(left, opts),
-         {:ok, r, rj} <- to_expr_coerced(right, element_type, opts) do
+         {:ok, r_res, rj} <- resolve_operand(right, element_type, opts),
+         {:ok, r} <- expr_only(r_res, "includes") do
       {:ok, dynamic([row], ^r in ^l), lj ++ rj}
     end
   end
@@ -262,6 +276,10 @@ defmodule EctoQueryParser.Builder do
   defp to_expr({:float, v}, _opts), do: {:ok, dynamic([row], ^v), []}
   defp to_expr({:boolean, v}, _opts), do: {:ok, dynamic([row], ^v), []}
 
+  # {:value, term} carries a bound parameter value with no literal syntax
+  # (Date, DateTime, Decimal, ...); it is pinned directly.
+  defp to_expr({:value, v}, _opts), do: {:ok, dynamic([row], ^v), []}
+
   defp to_expr({:identifier, name}, opts) do
     if String.contains?(name, ".") do
       resolve_dotted_identifier(name, opts)
@@ -274,15 +292,9 @@ defmodule EctoQueryParser.Builder do
   end
 
   defp to_expr({:list, items}, _opts) do
-    values =
-      Enum.map(items, fn
-        {:string, v} -> v
-        {:integer, v} -> v
-        {:float, v} -> v
-        {:boolean, v} -> v
-      end)
-
-    {:ok, dynamic([row], ^values), []}
+    with {:ok, values} <- literal_values(items) do
+      {:ok, dynamic([row], ^values), []}
+    end
   end
 
   defp to_expr({:function, "now", []}, _opts) do
@@ -619,19 +631,172 @@ defmodule EctoQueryParser.Builder do
     end
   end
 
-  # --- Type coercion of literal operands ---
+  # --- Operand resolution (literal transform + type coercion) ---
 
-  # Resolves both operands of a comparison, applying type coercion when one
-  # side is a literal and the other identifies a typed field.
-  defp build_comparison_operands(left, right, opts) do
-    left_type = field_type(left, opts)
-    right_type = field_type(right, opts)
+  # Resolves one operand of a comparison/BETWEEN against the opposite side's
+  # type. Returns {:ok, {:expr, dynamic}, joins} for a plain expression or
+  # {:ok, {:range, lo, hi}, []} when the literal transform declared the
+  # string literal to denote an inclusive range.
+  defp resolve_operand(ast, target_type, opts) do
+    case literal_transform_result(ast, target_type, opts) do
+      {:ok, term} ->
+        {:ok, {:expr, dynamic([row], ^term)}, []}
 
-    with {:ok, l, lj} <- to_expr_coerced(left, right_type, opts),
-         {:ok, r, rj} <- to_expr_coerced(right, left_type, opts) do
-      {:ok, l, lj, r, rj}
+      {:range, {lo, hi}} ->
+        {:ok, {:range, lo, hi}, []}
+
+      :default ->
+        with {:ok, d, joins} <- to_expr_coerced(ast, target_type, opts) do
+          {:ok, {:expr, d}, joins}
+        end
+
+      {:error, _} = err ->
+        err
     end
   end
+
+  # Compiles a comparison whose operands may be ranges. The range table
+  # (inclusive bounds):
+  #
+  #   field == range  →  field >= lo AND field <= hi
+  #   field != range  →  NOT (field >= lo AND field <= hi)
+  #   field >= range  →  field >= lo        field >  range  →  field > hi
+  #   field <= range  →  field <= hi        field <  range  →  field < lo
+  #
+  # A range on the left flips the operator (`range <= field` ≡ `field >= range`).
+  defp compile_comparison(:==, {:expr, l}, {:expr, r}, j), do: {:ok, dynamic([row], ^l == ^r), j}
+  defp compile_comparison(:!=, {:expr, l}, {:expr, r}, j), do: {:ok, dynamic([row], ^l != ^r), j}
+  defp compile_comparison(:>=, {:expr, l}, {:expr, r}, j), do: {:ok, dynamic([row], ^l >= ^r), j}
+  defp compile_comparison(:<=, {:expr, l}, {:expr, r}, j), do: {:ok, dynamic([row], ^l <= ^r), j}
+  defp compile_comparison(:>, {:expr, l}, {:expr, r}, j), do: {:ok, dynamic([row], ^l > ^r), j}
+  defp compile_comparison(:<, {:expr, l}, {:expr, r}, j), do: {:ok, dynamic([row], ^l < ^r), j}
+
+  defp compile_comparison(:==, {:expr, l}, {:range, lo, hi}, j),
+    do: {:ok, dynamic([row], ^l >= ^lo and ^l <= ^hi), j}
+
+  defp compile_comparison(:!=, {:expr, l}, {:range, lo, hi}, j),
+    do: {:ok, dynamic([row], not (^l >= ^lo and ^l <= ^hi)), j}
+
+  defp compile_comparison(:>=, {:expr, l}, {:range, lo, _hi}, j),
+    do: {:ok, dynamic([row], ^l >= ^lo), j}
+
+  defp compile_comparison(:>, {:expr, l}, {:range, _lo, hi}, j),
+    do: {:ok, dynamic([row], ^l > ^hi), j}
+
+  defp compile_comparison(:<=, {:expr, l}, {:range, _lo, hi}, j),
+    do: {:ok, dynamic([row], ^l <= ^hi), j}
+
+  defp compile_comparison(:<, {:expr, l}, {:range, lo, _hi}, j),
+    do: {:ok, dynamic([row], ^l < ^lo), j}
+
+  defp compile_comparison(op, {:range, _, _} = range, {:expr, _} = expr, j),
+    do: compile_comparison(flip_op(op), expr, range, j)
+
+  defp compile_comparison(op, {:range, _, _}, {:range, _, _}, _j) do
+    {:error,
+     "literal_transform returned a range for both sides of #{op} — " <>
+       "at most one side of a comparison may resolve to a range"}
+  end
+
+  defp flip_op(:==), do: :==
+  defp flip_op(:!=), do: :!=
+  defp flip_op(:>=), do: :<=
+  defp flip_op(:<=), do: :>=
+  defp flip_op(:>), do: :<
+  defp flip_op(:<), do: :>
+
+  defp between_bound({:expr, d}, _which), do: d
+  defp between_bound({:range, lo, _hi}, :low), do: dynamic([row], ^lo)
+  defp between_bound({:range, _lo, hi}, :high), do: dynamic([row], ^hi)
+
+  defp expr_only({:expr, d}, _op_name), do: {:ok, d}
+
+  defp expr_only({:range, _lo, _hi}, op_name) do
+    {:error,
+     "literal_transform returned a range for #{op_name} — " <>
+       "ranges are only supported for comparison and BETWEEN operators"}
+  end
+
+  # like/ilike patterns: apply the literal transform (with the pattern
+  # field's type) but skip the type coercion — patterns are always text.
+  defp resolve_pattern(right, left, op_name, opts) do
+    case literal_transform_result(right, field_type(left, opts), opts) do
+      {:ok, term} ->
+        {:ok, dynamic([row], ^term), []}
+
+      {:range, _} ->
+        {:error,
+         "literal_transform returned a range for #{op_name} — " <>
+           "ranges are only supported for comparison and BETWEEN operators"}
+
+      :default ->
+        to_expr(right, opts)
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # IN list elements: run the literal transform per string element against
+  # the field's element type. Returns {:ok, transformed?, items} where
+  # transformed elements are replaced with {:value, term} nodes; when any
+  # element was transformed the list is pinned without a type/2 wrap (the
+  # transform owns the types).
+  defp transform_list_elements(items, element_type, opts) do
+    Enum.reduce_while(items, {:ok, false, []}, fn item, {:ok, transformed?, acc} ->
+      case literal_transform_result(item, element_type, opts) do
+        {:ok, term} ->
+          {:cont, {:ok, true, [{:value, term} | acc]}}
+
+        {:range, _} ->
+          {:halt,
+           {:error,
+            "literal_transform returned a range for an IN list element — " <>
+              "ranges are only supported for comparison and BETWEEN operators"}}
+
+        :default ->
+          {:cont, {:ok, transformed?, [item | acc]}}
+
+        {:error, _} = err ->
+          {:halt, err}
+      end
+    end)
+    |> case do
+      {:ok, transformed?, acc} -> {:ok, transformed?, Enum.reverse(acc)}
+      {:error, _} = err -> err
+    end
+  end
+
+  # Invoke the :literal_transform option for a string literal (including a
+  # substituted string parameter) resolved against a known target type.
+  defp literal_transform_result({:string, raw}, target_type, opts)
+       when not is_nil(target_type) do
+    case Keyword.get(opts, :literal_transform) do
+      fun when is_function(fun, 2) ->
+        case fun.(target_type, raw) do
+          {:ok, term} ->
+            {:ok, term}
+
+          {:range, {_lo, _hi}} = range ->
+            range
+
+          :default ->
+            :default
+
+          other ->
+            {:error,
+             "literal_transform must return {:ok, term}, {:range, {lo, hi}}, " <>
+               "or :default, got: #{inspect(other)}"}
+        end
+
+      _ ->
+        :default
+    end
+  end
+
+  defp literal_transform_result(_ast, _target_type, _opts), do: :default
+
+  # --- Type coercion of literal operands ---
 
   # When a literal sits opposite a typed field in a comparison, wrap it with
   # `type/2` so Ecto and the DB driver cast it to the column's type rather than
@@ -661,6 +826,10 @@ defmodule EctoQueryParser.Builder do
   defp coercion_type({:integer, _}, type), do: type
   defp coercion_type({:float, _}, type), do: type
   defp coercion_type({:boolean, _}, type), do: type
+  # Bound parameter values without a literal syntax (Date, Decimal, ...) are
+  # always wrapped when a target type is known; `type/2` casting a value that
+  # already matches the column type is a no-op.
+  defp coercion_type({:value, _}, type), do: type
 
   defp coercion_type({:list, items}, {:array, inner}) when not is_nil(inner) do
     if Enum.all?(items, &(coercion_type(&1, inner) == nil)) do
@@ -676,20 +845,33 @@ defmodule EctoQueryParser.Builder do
   defp literal_value({:integer, v}), do: {:ok, v}
   defp literal_value({:float, v}), do: {:ok, v}
   defp literal_value({:boolean, v}), do: {:ok, v}
+  defp literal_value({:value, v}), do: {:ok, v}
 
   defp literal_value({:list, items}) do
-    values =
-      Enum.map(items, fn
-        {:string, v} -> v
-        {:integer, v} -> v
-        {:float, v} -> v
-        {:boolean, v} -> v
-      end)
-
-    {:ok, values}
+    case literal_values(items) do
+      {:ok, values} -> {:ok, values}
+      {:error, _} -> :error
+    end
   end
 
   defp literal_value(_), do: :error
+
+  # Extract raw values from a list of literal AST nodes.
+  defp literal_values(items) do
+    Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+      case literal_value(item) do
+        {:ok, v} ->
+          {:cont, {:ok, [v | acc]}}
+
+        :error ->
+          {:halt, {:error, "lists may only contain literal values, got: #{inspect(item)}"}}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _} = err -> err
+    end
+  end
 
   # --- Field type resolution ---
 

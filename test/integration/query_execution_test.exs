@@ -560,4 +560,121 @@ defmodule EctoQueryParser.Integration.QueryExecutionTest do
       assert TestRepo.all(query) == []
     end
   end
+
+  # -- Parameters, optional groups, and the literal transform --
+
+  describe "parameters" do
+    test "string param against a string field" do
+      assert run("name == {{n}}", params: %{"n" => "alice"}) == []
+    end
+
+    test "string param coerced against a date field" do
+      assert run("performed_on >= {{start}}", params: %{"start" => "2026-05-20"}) == []
+    end
+
+    test "Date struct param against a date field" do
+      assert run("performed_on == {{d}}", params: %{"d" => ~D[2026-05-20]}) == []
+    end
+
+    test "params as BETWEEN bounds" do
+      assert run("performed_on BETWEEN {{lo}} AND {{hi}}",
+               params: %{"lo" => "2026-01-01", "hi" => "2026-12-31"}
+             ) == []
+    end
+
+    test "params as IN list elements" do
+      assert run("age IN [{{a}}, {{b}}]", params: %{"a" => 18, "b" => 21}) == []
+    end
+
+    test "param with contains" do
+      assert run("name contains {{q}}", params: %{"q" => "al%ice"}) == []
+    end
+
+    test "param on an association path" do
+      assert run("author.hired_on >= {{start}}", params: %{"start" => "2026-01-01"}) == []
+    end
+
+    test "param inside an EXISTS predicate" do
+      {:ok, query} =
+        EctoQueryParser.apply(
+          EctoQueryParser.Test.Author,
+          "posts.name == {{n}}",
+          params: %{"n" => "anything"}
+        )
+
+      assert TestRepo.all(query) == []
+    end
+  end
+
+  describe "optional groups" do
+    test "bound group participates in the query" do
+      assert run(~s(status == "n" [[AND performed_on >= {{start}}]]),
+               params: %{"start" => "2026-05-20"}
+             ) == []
+    end
+
+    test "unbound group is pruned and the rest executes" do
+      assert run(~s(status == "n" [[AND performed_on >= {{start}}]]), params: %{}) == []
+    end
+
+    test "fully pruned filter executes as WHERE true" do
+      # Empty table, so even the neutral filter returns no rows — the point
+      # is that the generated SQL is valid.
+      assert run("[[name == {{n}}]]", params: %{}) == []
+    end
+
+    test "pruned group on a plural association executes" do
+      {:ok, query} =
+        EctoQueryParser.apply(
+          EctoQueryParser.Test.Author,
+          ~s(posts.name == "a" [[AND posts.status == {{s}}]]),
+          params: %{}
+        )
+
+      assert TestRepo.all(query) == []
+    end
+  end
+
+  describe "literal_transform" do
+    defp date_transform do
+      fn
+        :date, "last year" -> {:range, {~D[2025-01-01], ~D[2025-12-31]}}
+        :date, "today" -> {:ok, ~D[2026-07-28]}
+        _, _ -> :default
+      end
+    end
+
+    test "range expansion for == executes" do
+      assert run(~s{performed_on == "last year"}, literal_transform: date_transform()) == []
+    end
+
+    test "range expansion for != executes" do
+      assert run(~s{performed_on != "last year"}, literal_transform: date_transform()) == []
+    end
+
+    test "range expansion for strict comparison executes" do
+      assert run(~s{performed_on > "last year"}, literal_transform: date_transform()) == []
+    end
+
+    test "{:ok, term} replacement executes" do
+      assert run(~s{performed_on == "today"}, literal_transform: date_transform()) == []
+    end
+
+    test "BETWEEN with transformed bounds executes" do
+      assert run(~s{performed_on BETWEEN "last year" AND "today"},
+               literal_transform: date_transform()
+             ) == []
+    end
+
+    test "transform on an association path executes" do
+      assert run(~s{author.hired_on == "last year"}, literal_transform: date_transform()) == []
+    end
+
+    test "transform combined with a bound param executes" do
+      assert run("performed_on == {{when}}",
+               params: %{"when" => "last year"},
+               literal_transform: date_transform()
+             ) == []
+    end
+  end
 end

@@ -1004,6 +1004,285 @@ defmodule EctoQueryParserTest do
     end
   end
 
+  describe "parameters ({{name}})" do
+    test "parses a parameter on the right side of a comparison" do
+      assert EctoQueryParser.parse("status == {{status}}") ==
+               {:ok, {:op, :==, {:identifier, "status"}, {:param, "status"}}}
+    end
+
+    test "parameter name stays a string" do
+      assert {:ok, {:op, :==, _, {:param, name}}} = EctoQueryParser.parse("a == {{p1}}")
+      assert is_binary(name)
+      assert name == "p1"
+    end
+
+    test "tolerates whitespace inside the braces" do
+      assert EctoQueryParser.parse("status == {{ status }}") ==
+               {:ok, {:op, :==, {:identifier, "status"}, {:param, "status"}}}
+    end
+
+    test "parses a standalone parameter" do
+      assert EctoQueryParser.parse("{{x}}") == {:ok, {:param, "x"}}
+    end
+
+    test "parses parameters as list elements" do
+      assert EctoQueryParser.parse("x IN [1, {{p}}]") ==
+               {:ok, {:op, :in, {:identifier, "x"}, {:list, [{:integer, 1}, {:param, "p"}]}}}
+    end
+
+    test "parses parameters as function arguments" do
+      assert EctoQueryParser.parse("coalesce(name, {{fallback}}) == {{v}}") ==
+               {:ok,
+                {:op, :==, {:function, "coalesce", [{:identifier, "name"}, {:param, "fallback"}]},
+                 {:param, "v"}}}
+    end
+
+    test "parses parameters as BETWEEN bounds" do
+      assert EctoQueryParser.parse("age BETWEEN {{lo}} AND {{hi}}") ==
+               {:ok, {:between, {:identifier, "age"}, {:param, "lo"}, {:param, "hi"}}}
+    end
+
+    test "parses parameter names with underscores and digits" do
+      assert EctoQueryParser.parse("a == {{_start_2}}") ==
+               {:ok, {:op, :==, {:identifier, "a"}, {:param, "_start_2"}}}
+    end
+
+    test "rejects a parameter name starting with a digit" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("a == {{1bad}}")
+    end
+
+    test "rejects an empty parameter name" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("a == {{}}")
+    end
+
+    test "rejects a parameter name with a dash" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("a == {{a-b}}")
+    end
+
+    test "rejects an unterminated parameter" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("a == {{p")
+    end
+  end
+
+  describe "optional groups ([[ ... ]])" do
+    test "AND group attaches to an AND chain" do
+      assert EctoQueryParser.parse("a == 1 [[AND b == {{p}}]]") ==
+               {:ok,
+                {:and,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :and, [{:op, :==, {:identifier, "b"}, {:param, "p"}}]}
+                 ]}}
+    end
+
+    test "lowercase connector inside the group" do
+      assert EctoQueryParser.parse("a == 1 [[and b == {{p}}]]") ==
+               {:ok,
+                {:and,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :and, [{:op, :==, {:identifier, "b"}, {:param, "p"}}]}
+                 ]}}
+    end
+
+    test "OR group attaches to an OR chain" do
+      assert EctoQueryParser.parse("a == 1 [[OR b == {{p}}]]") ==
+               {:ok,
+                {:or,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :or, [{:op, :==, {:identifier, "b"}, {:param, "p"}}]}
+                 ]}}
+    end
+
+    test "multiple groups after one expression" do
+      assert EctoQueryParser.parse("a == 1 [[AND b == {{x}}]] [[AND c == {{y}}]]") ==
+               {:ok,
+                {:and,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :and, [{:op, :==, {:identifier, "b"}, {:param, "x"}}]},
+                   {:optional, :and, [{:op, :==, {:identifier, "c"}, {:param, "y"}}]}
+                 ]}}
+    end
+
+    test "group may contain an AND chain of predicates" do
+      assert EctoQueryParser.parse("a == 1 [[AND b == {{x}} AND c == {{y}}]]") ==
+               {:ok,
+                {:and,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :and,
+                    [
+                      {:op, :==, {:identifier, "b"}, {:param, "x"}},
+                      {:op, :==, {:identifier, "c"}, {:param, "y"}}
+                    ]}
+                 ]}}
+    end
+
+    test "OR group content binds its inner AND tighter, like unbracketed text" do
+      assert EctoQueryParser.parse("a == 1 [[OR b == {{p}} AND c == 2]]") ==
+               {:ok,
+                {:or,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :or,
+                    [
+                      {:and,
+                       [
+                         {:op, :==, {:identifier, "b"}, {:param, "p"}},
+                         {:op, :==, {:identifier, "c"}, {:integer, 2}}
+                       ]}
+                    ]}
+                 ]}}
+    end
+
+    test "group continues after the connector chain" do
+      assert EctoQueryParser.parse("a == 1 [[AND b == 2]] AND c == 3") ==
+               {:ok,
+                {:and,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :and, [{:op, :==, {:identifier, "b"}, {:integer, 2}}]},
+                   {:op, :==, {:identifier, "c"}, {:integer, 3}}
+                 ]}}
+    end
+
+    test "standalone connector-less group as a whole filter" do
+      assert EctoQueryParser.parse("[[a == {{p}}]]") ==
+               {:ok, {:optional, :and, [{:op, :==, {:identifier, "a"}, {:param, "p"}}]}}
+    end
+
+    test "standalone group followed by connector-attached groups" do
+      assert EctoQueryParser.parse("[[a == {{x}}]] [[AND b == {{y}}]]") ==
+               {:ok,
+                {:and,
+                 [
+                   {:optional, :and, [{:op, :==, {:identifier, "a"}, {:param, "x"}}]},
+                   {:optional, :and, [{:op, :==, {:identifier, "b"}, {:param, "y"}}]}
+                 ]}}
+    end
+
+    test "group without parameters parses the same" do
+      assert EctoQueryParser.parse("a == 1 [[AND b == 2]]") ==
+               {:ok,
+                {:and,
+                 [
+                   {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                   {:optional, :and, [{:op, :==, {:identifier, "b"}, {:integer, 2}}]}
+                 ]}}
+    end
+
+    test "group inside parentheses" do
+      assert EctoQueryParser.parse("(a == 1 [[AND b == 2]]) OR c == 3") ==
+               {:ok,
+                {:or,
+                 [
+                   {:and,
+                    [
+                      {:op, :==, {:identifier, "a"}, {:integer, 1}},
+                      {:optional, :and, [{:op, :==, {:identifier, "b"}, {:integer, 2}}]}
+                    ]},
+                   {:op, :==, {:identifier, "c"}, {:integer, 3}}
+                 ]}}
+    end
+
+    test "whitespace variations around brackets" do
+      assert {:ok, {:and, [_, {:optional, :and, [_]}]}} =
+               EctoQueryParser.parse("a == 1   [[  AND   b == {{p}}  ]]")
+    end
+
+    test "nested groups are a ParseError with a position" do
+      assert {:error, %EctoQueryParser.ParseError{line: 1}} =
+               EctoQueryParser.parse("[[a == 1 [[AND b == 2]] ]]")
+    end
+
+    test "unmatched opening brackets are a ParseError with a position" do
+      assert {:error, %EctoQueryParser.ParseError{} = err} =
+               EctoQueryParser.parse("a == 1 [[AND b == 2")
+
+      assert err.column == 8
+      assert err.rest == "[[AND b == 2"
+    end
+
+    test "stray closing brackets are a ParseError" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("a == 1 ]]")
+    end
+
+    test "leading connector group without a preceding expression is a ParseError" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("[[AND a == 1]]")
+    end
+
+    test "NOT cannot negate an optional group directly" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parse("NOT [[a == 1]]")
+    end
+
+    test "nested list literals still parse (no [[ ambiguity)" do
+      assert EctoQueryParser.parse("x IN [[1], [2]]") ==
+               {:ok,
+                {:op, :in, {:identifier, "x"},
+                 {:list, [{:list, [{:integer, 1}]}, {:list, [{:integer, 2}]}]}}}
+    end
+  end
+
+  describe "parameters/1 discovery" do
+    test "lists parameters in order of first appearance" do
+      assert EctoQueryParser.parameters("a == {{one}} AND b == {{two}} OR c == {{three}}") ==
+               {:ok,
+                [
+                  %{name: "one", required: true},
+                  %{name: "two", required: true},
+                  %{name: "three", required: true}
+                ]}
+    end
+
+    test "params only inside optional groups are not required" do
+      assert EctoQueryParser.parameters("status == {{status}} [[AND created_at >= {{start}}]]") ==
+               {:ok, [%{name: "status", required: true}, %{name: "start", required: false}]}
+    end
+
+    test "a param both inside and outside groups is required" do
+      assert EctoQueryParser.parameters("a == {{p}} [[AND b == {{p}}]]") ==
+               {:ok, [%{name: "p", required: true}]}
+    end
+
+    test "duplicates keep first-appearance order" do
+      assert EctoQueryParser.parameters("a == {{x}} AND b == {{y}} AND c == {{x}}") ==
+               {:ok, [%{name: "x", required: true}, %{name: "y", required: true}]}
+    end
+
+    test "params in lists, function args, and BETWEEN bounds are discovered" do
+      assert EctoQueryParser.parameters(
+               "x IN [{{a}}] AND coalesce(name, {{b}}) == 1 AND y BETWEEN {{c}} AND {{d}}"
+             ) ==
+               {:ok,
+                [
+                  %{name: "a", required: true},
+                  %{name: "b", required: true},
+                  %{name: "c", required: true},
+                  %{name: "d", required: true}
+                ]}
+    end
+
+    test "params under NOT and inside parentheses are discovered" do
+      assert EctoQueryParser.parameters("NOT (a == {{p}} OR b IS NULL)") ==
+               {:ok, [%{name: "p", required: true}]}
+    end
+
+    test "standalone optional group params are optional" do
+      assert EctoQueryParser.parameters("[[a == {{p}}]]") ==
+               {:ok, [%{name: "p", required: false}]}
+    end
+
+    test "filter without parameters returns an empty list" do
+      assert EctoQueryParser.parameters(~s{name == "alice"}) == {:ok, []}
+    end
+
+    test "parse failures return a ParseError" do
+      assert {:error, %EctoQueryParser.ParseError{}} = EctoQueryParser.parameters("a == {{}}")
+    end
+  end
+
   describe "error cases" do
     alias EctoQueryParser.ParseError
 
