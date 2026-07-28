@@ -13,6 +13,15 @@ defmodule EctoQueryParser.BuilderTest do
     inspect(query)
   end
 
+  # Natural-language date transform used by the literal_transform tests.
+  defp season_transform do
+    fn
+      :date, "last year" -> {:range, {~D[2025-01-01], ~D[2025-12-31]}}
+      :date, "today" -> {:ok, ~D[2026-07-28]}
+      _, _ -> :default
+    end
+  end
+
   describe "basic operators" do
     test "== with string" do
       assert {:ok, query} = build(~s{name == "alice"})
@@ -1271,6 +1280,489 @@ defmodule EctoQueryParser.BuilderTest do
 
       assert query.from.as == :__eqp_source
       assert inspect(query) =~ "parent_as(:__eqp_source)"
+    end
+  end
+
+  describe "parameters (params option)" do
+    test "string param binds like an inline literal" do
+      assert {:ok, query} = build("name == {{n}}", params: %{"n" => "alice"})
+      query_str = inspect(query)
+      assert query_str =~ ~s|name == ^"alice"|
+      refute query_str =~ "type("
+    end
+
+    test "integer param binds without coercion against integer field" do
+      assert {:ok, query} = build("age >= {{min}}", params: %{"min" => 21})
+      query_str = inspect(query)
+      assert query_str =~ "age >= ^21"
+      refute query_str =~ "type("
+    end
+
+    test "string param coerces against a typed field (type/2 wrap)" do
+      assert {:ok, query} = build("performed_on >= {{start}}", params: %{"start" => "2026-05-20"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "Date struct param is pinned and cast against the date field" do
+      assert {:ok, query} = build("performed_on == {{d}}", params: %{"d" => ~D[2026-05-20]})
+      query_str = inspect(query)
+      assert query_str =~ "~D[2026-05-20]"
+      assert query_str =~ ":date"
+    end
+
+    test "param works on the left side of a comparison" do
+      assert {:ok, query} = build("{{start}} <= performed_on", params: %{"start" => "2026-05-20"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "param in an IN list coerces with the other elements" do
+      assert {:ok, query} =
+               build(~s(performed_on IN ["2026-01-01", {{d}}]), params: %{"d" => "2026-01-02"})
+
+      query_str = inspect(query)
+      assert query_str =~ "{:array, :date}"
+      assert query_str =~ "2026-01-02"
+    end
+
+    test "list param for IN binds the whole list" do
+      assert {:ok, query} = build("age IN [{{a}}, {{b}}]", params: %{"a" => 1, "b" => 2})
+      assert inspect(query) =~ "age in ^[1, 2]"
+    end
+
+    test "param as BETWEEN bounds" do
+      assert {:ok, query} =
+               build("performed_on BETWEEN {{lo}} AND {{hi}}",
+                 params: %{"lo" => "2026-01-01", "hi" => "2026-02-01"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ ">="
+      assert query_str =~ "<="
+      assert occurrences(query_str, "type(") == 2
+    end
+
+    test "string param works with contains (pattern is escaped)" do
+      assert {:ok, query} = build("name contains {{q}}", params: %{"q" => "al%ice"})
+      assert inspect(query) =~ ~s|%al\\\\%ice%|
+    end
+
+    test "non-string param with contains errors like an inline literal" do
+      assert {:error, msg} = build("name contains {{q}}", params: %{"q" => 42})
+      assert msg =~ "contains operator requires a string or identifier value"
+    end
+
+    test "param on an association path coerces to the leaf type" do
+      assert {:ok, query} =
+               build("author.hired_on >= {{start}}", params: %{"start" => "2026-01-01"})
+
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ ":date"
+    end
+
+    test "param inside an EXISTS predicate (plural association)" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 "posts.name == {{n}}",
+                 params: %{"n" => "hello"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ ~s|^"hello"|
+    end
+
+    test "param inside a NOT EXISTS predicate" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 "NOT posts.name == {{n}}",
+                 params: %{"n" => "x"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "not exists("
+      assert query_str =~ ~s|^"x"|
+    end
+
+    test "missing param is a build error" do
+      assert {:error, "missing required parameter: n"} = build("name == {{n}}", params: %{})
+    end
+
+    test "nil param value counts as unbound" do
+      assert {:error, "missing required parameter: n"} =
+               build("name == {{n}}", params: %{"n" => nil})
+    end
+
+    test "missing params option entirely is a build error" do
+      assert {:error, "missing required parameter: n"} = build("name == {{n}}")
+    end
+
+    test "atom-keyed params maps are accepted" do
+      assert {:ok, query} = build("name == {{n}}", params: %{n: "alice"})
+      assert inspect(query) =~ ~s|^"alice"|
+    end
+
+    test "false and empty-string values are bound, not treated as missing" do
+      assert {:ok, query} = build("active == {{flag}}", params: %{"flag" => false})
+      assert inspect(query) =~ "active == ^false"
+
+      assert {:ok, query} = build("name == {{n}}", params: %{"n" => ""})
+      assert inspect(query) =~ ~s|name == ^""|
+    end
+  end
+
+  describe "optional group pruning" do
+    test "group with a bound param participates as if brackets were absent" do
+      assert {:ok, query} =
+               build(~s(status == "x" [[AND performed_on >= {{start}}]]),
+                 params: %{"start" => "2026-01-01"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ ~s|status == ^"x"|
+      assert query_str =~ " and "
+      assert query_str =~ ":date"
+    end
+
+    test "group with an unbound param is pruned" do
+      assert {:ok, query} =
+               build(~s(status == "x" [[AND performed_on >= {{start}}]]), params: %{})
+
+      query_str = inspect(query)
+      assert query_str =~ ~s|status == ^"x"|
+      refute query_str =~ "performed_on"
+    end
+
+    test "nil-valued param prunes the group" do
+      assert {:ok, query} =
+               build(~s(status == "x" [[AND performed_on >= {{start}}]]),
+                 params: %{"start" => nil}
+               )
+
+      refute inspect(query) =~ "performed_on"
+    end
+
+    test "multi-param group requires every param bound" do
+      filter = ~s(status == "x" [[AND age >= {{min}} AND age <= {{max}}]])
+
+      assert {:ok, pruned} = build(filter, params: %{"min" => 18})
+      refute inspect(pruned) =~ "age"
+
+      assert {:ok, kept} = build(filter, params: %{"min" => 18, "max" => 65})
+      query_str = inspect(kept)
+      assert query_str =~ "age >= ^18"
+      assert query_str =~ "age <= ^65"
+    end
+
+    test "groups prune independently" do
+      filter = ~s(status == "x" [[AND age >= {{min}}]] [[AND name == {{n}}]])
+
+      assert {:ok, query} = build(filter, params: %{"n" => "alice"})
+      query_str = inspect(query)
+      refute query_str =~ "age"
+      assert query_str =~ ~s|name == ^"alice"|
+    end
+
+    test "a group containing no parameters is always included" do
+      assert {:ok, query} = build(~s(status == "x" [[AND age >= 18]]), params: %{})
+      query_str = inspect(query)
+      assert query_str =~ "age >= ^18"
+
+      # even without a :params option at all
+      assert {:ok, query} = build(~s(status == "x" [[AND age >= 18]]))
+      assert inspect(query) =~ "age >= ^18"
+    end
+
+    test "OR group prunes and participates correctly" do
+      filter = ~s(role == "admin" [[OR role == {{alt}}]])
+
+      assert {:ok, pruned} = build(filter, params: %{})
+      refute inspect(pruned) =~ " or "
+
+      assert {:ok, kept} = build(filter, params: %{"alt" => "mod"})
+      assert inspect(kept) =~ " or "
+    end
+
+    test "fully pruned filter degenerates to WHERE true" do
+      assert {:ok, query} = build("[[name == {{n}}]]", params: %{})
+      assert inspect(query) =~ "where: ^true"
+    end
+
+    test "standalone group with bound param builds normally" do
+      assert {:ok, query} = build("[[name == {{n}}]]", params: %{"n" => "alice"})
+      assert inspect(query) =~ ~s|name == ^"alice"|
+    end
+
+    test "chain of standalone groups prunes each independently" do
+      filter = "[[name == {{n}}]] [[AND age >= {{min}}]]"
+
+      assert {:ok, query} = build(filter, params: %{"min" => 18})
+      query_str = inspect(query)
+      refute query_str =~ "name =="
+      assert query_str =~ "age >= ^18"
+
+      assert {:ok, query} = build(filter, params: %{})
+      assert inspect(query) =~ "where: ^true"
+    end
+
+    test "group on a plural association merges into the same EXISTS when bound" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 ~s(posts.name == "a" [[AND posts.status == {{s}}]]),
+                 params: %{"s" => "live"}
+               )
+
+      query_str = inspect(query)
+      assert occurrences(query_str, "exists(") == 1
+      assert query_str =~ ~s|^"live"|
+    end
+
+    test "group on a plural association is pruned when unbound" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 ~s(posts.name == "a" [[AND posts.status == {{s}}]]),
+                 params: %{}
+               )
+
+      query_str = inspect(query)
+      assert occurrences(query_str, "exists(") == 1
+      refute query_str =~ "status"
+    end
+
+    test "pruning happens inside parentheses too" do
+      assert {:ok, query} =
+               build("(status == \"x\" [[AND age >= {{min}}]]) OR active == true", params: %{})
+
+      query_str = inspect(query)
+      refute query_str =~ "age"
+      assert query_str =~ " or "
+    end
+  end
+
+  describe "literal_transform option" do
+    test ":default falls through to the existing coercion" do
+      assert {:ok, query} =
+               build(~s{performed_on >= "2026-05-20"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "{:ok, term} replaces the value with no type/2 wrap" do
+      assert {:ok, query} =
+               build(~s{performed_on == "today"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "== ^~D[2026-07-28]"
+      refute query_str =~ "type("
+    end
+
+    test "range with == compiles to >= lo AND <= hi" do
+      assert {:ok, query} =
+               build(~s{performed_on == "last year"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "performed_on >= ^~D[2025-01-01]"
+      assert query_str =~ "performed_on <= ^~D[2025-12-31]"
+      refute query_str =~ "type("
+    end
+
+    test "range with != compiles to NOT(>= lo AND <= hi)" do
+      assert {:ok, query} =
+               build(~s{performed_on != "last year"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "not ("
+      assert query_str =~ ">= ^~D[2025-01-01]"
+      assert query_str =~ "<= ^~D[2025-12-31]"
+    end
+
+    test "range with >= uses lo" do
+      assert {:ok, query} =
+               build(~s{performed_on >= "last year"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "performed_on >= ^~D[2025-01-01]"
+      refute query_str =~ "2025-12-31"
+    end
+
+    test "range with > uses hi" do
+      assert {:ok, query} =
+               build(~s{performed_on > "last year"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "performed_on > ^~D[2025-12-31]"
+      refute query_str =~ "2025-01-01"
+    end
+
+    test "range with <= uses hi" do
+      assert {:ok, query} =
+               build(~s{performed_on <= "last year"}, literal_transform: season_transform())
+
+      assert inspect(query) =~ "performed_on <= ^~D[2025-12-31]"
+    end
+
+    test "range with < uses lo" do
+      assert {:ok, query} =
+               build(~s{performed_on < "last year"}, literal_transform: season_transform())
+
+      assert inspect(query) =~ "performed_on < ^~D[2025-01-01]"
+    end
+
+    test "range literal on the left side flips the operator" do
+      assert {:ok, query} =
+               build(~s{"last year" <= performed_on}, literal_transform: season_transform())
+
+      # "last year" <= performed_on  ≡  performed_on >= range  →  >= lo
+      assert inspect(query) =~ "performed_on >= ^~D[2025-01-01]"
+    end
+
+    test "BETWEEN bounds resolve independently (low takes lo, high takes hi)" do
+      assert {:ok, query} =
+               build(~s{performed_on BETWEEN "last year" AND "today"},
+                 literal_transform: season_transform()
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ ">= ^~D[2025-01-01]"
+      assert query_str =~ "<= ^~D[2026-07-28]"
+    end
+
+    test "BETWEEN with ranges on both bounds uses low.lo and high.hi" do
+      assert {:ok, query} =
+               build(~s{performed_on BETWEEN "last year" AND "last year"},
+                 literal_transform: season_transform()
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ ">= ^~D[2025-01-01]"
+      assert query_str =~ "<= ^~D[2025-12-31]"
+    end
+
+    test "range for an IN list element is a build error" do
+      assert {:error, msg} =
+               build(~s{performed_on IN ["last year"]}, literal_transform: season_transform())
+
+      assert msg =~ "IN list element"
+      assert msg =~ "only supported for comparison and BETWEEN"
+    end
+
+    test "range for LIKE is a build error" do
+      assert {:error, msg} =
+               build(~s{name like "x"}, literal_transform: fn _, _ -> {:range, {1, 2}} end)
+
+      assert msg =~ "LIKE"
+      assert msg =~ "only supported for comparison and BETWEEN"
+    end
+
+    test "range for includes is a build error" do
+      assert {:error, msg} =
+               build(~s{tags includes "x"}, literal_transform: fn _, _ -> {:range, {1, 2}} end)
+
+      assert msg =~ "includes"
+      assert msg =~ "only supported for comparison and BETWEEN"
+    end
+
+    test "{:ok, term} for an IN list element replaces it and pins the list raw" do
+      transform = fn
+        :date, "today" -> {:ok, ~D[2026-07-28]}
+        _, _ -> :default
+      end
+
+      assert {:ok, query} =
+               build(~s{performed_on IN ["today", "2026-01-01"]}, literal_transform: transform)
+
+      query_str = inspect(query)
+      assert query_str =~ "~D[2026-07-28]"
+      assert query_str =~ "2026-01-01"
+      refute query_str =~ "type("
+    end
+
+    test "transform receives the leaf type on association paths" do
+      assert {:ok, query} =
+               build(~s{author.hired_on == "last year"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ ">= ^~D[2025-01-01]"
+      assert query_str =~ "<= ^~D[2025-12-31]"
+    end
+
+    test "transform applies inside EXISTS subqueries" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 ~s{posts.performed_on == "last year"},
+                 literal_transform: season_transform()
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ ">= ^~D[2025-01-01]"
+    end
+
+    test "transform applies to bound string parameter values" do
+      assert {:ok, query} =
+               build("performed_on == {{when}}",
+                 params: %{"when" => "last year"},
+                 literal_transform: season_transform()
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ ">= ^~D[2025-01-01]"
+      assert query_str =~ "<= ^~D[2025-12-31]"
+    end
+
+    test "transform is called for string literals against :string fields too" do
+      transform = fn
+        :string, "admin-ish" -> {:ok, "admin"}
+        _, _ -> :default
+      end
+
+      assert {:ok, query} = build(~s{role == "admin-ish"}, literal_transform: transform)
+      assert inspect(query) =~ ~s|role == ^"admin"|
+    end
+
+    test "transform is not called when no field type is known" do
+      transform = fn _type, _raw -> raise "should not be called" end
+
+      # Schemaless query without type info in allowed_fields: no target type.
+      import Ecto.Query, only: [from: 1]
+
+      assert {:ok, _} =
+               EctoQueryParser.apply(from("test_items"), ~s{name == "alice"},
+                 literal_transform: transform
+               )
+    end
+
+    test "transform is not called for non-string literals" do
+      transform = fn _type, _raw -> raise "should not be called" end
+      assert {:ok, _} = build("balance >= 100", literal_transform: transform)
+    end
+
+    test "invalid transform return is a build error" do
+      assert {:error, msg} =
+               build(~s{performed_on == "x"}, literal_transform: fn _, _ -> :bogus end)
+
+      assert msg =~ "literal_transform must return"
+    end
+
+    test "NOT composes with range results" do
+      assert {:ok, query} =
+               build(~s{NOT performed_on == "last year"}, literal_transform: season_transform())
+
+      query_str = inspect(query)
+      assert query_str =~ "not ("
+      assert query_str =~ ">= ^~D[2025-01-01]"
     end
   end
 

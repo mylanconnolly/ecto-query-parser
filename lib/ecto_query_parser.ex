@@ -25,7 +25,31 @@ defmodule EctoQueryParser do
   To enable type casting on JSON values (essential for numeric/boolean comparisons),
   use the keyword list format for `:allowed_fields`.
 
+  ## Parameters and optional groups
+
+  `{{name}}` placeholders may appear anywhere a literal may appear and are
+  bound at build time via the `:params` option (`params: %{"name" => value}`).
+  Bound values behave exactly like inline literals: they get the same type
+  coercion against the field's type and are bound as prepared-statement
+  parameters. An unbound (missing or `nil`) parameter is a build error —
+  unless every occurrence sits inside an `[[ ... ]]` optional group, in which
+  case the group is pruned from the query:
+
+      status == {{status}} [[AND created_at >= {{start}}]]
+
+  Use `parameters/1` to discover the parameters a filter string references.
+
   ## Options
+
+    * `:params` - map binding `{{name}}` parameters to values
+      (`%{"name" => value}`; atom keys are also accepted).
+
+    * `:literal_transform` - `fun(ecto_type, raw_string)` invoked for string
+      literals (and bound string parameter values) compared against a typed
+      field, before the built-in coercion. Return `{:ok, term}` to replace
+      the value, `{:range, {lo, hi}}` to expand the literal into an inclusive
+      range (comparison and BETWEEN operators only), or `:default` to keep
+      the normal behavior.
 
     * `:allowed_fields` - controls which fields are permitted. Supports two formats:
       - **Plain list** (access control only): `[:name, :age, :"metadata.key"]`
@@ -118,8 +142,11 @@ defmodule EctoQueryParser do
     source_binding = query.from.as
     builder_opts = Keyword.put(builder_opts, :source_binding, source_binding)
 
+    params = Keyword.get(opts, :params, %{})
+
     with {:ok, ast} <- parse(query_string),
-         {:ok, rewritten} <- EctoQueryParser.ExistsRewriter.rewrite(ast, builder_opts),
+         {:ok, pruned} <- EctoQueryParser.Params.prune(ast, params),
+         {:ok, rewritten} <- EctoQueryParser.ExistsRewriter.rewrite(pruned, builder_opts),
          {:ok, dynamic_expr, joins} <- EctoQueryParser.Builder.build(rewritten, builder_opts) do
       query =
         query
@@ -127,6 +154,26 @@ defmodule EctoQueryParser do
         |> where(^dynamic_expr)
 
       {:ok, query}
+    end
+  end
+
+  @doc """
+  Lists the `{{name}}` parameters referenced by a filter string, in order of
+  first appearance.
+
+  Each entry is `%{name: String.t(), required: boolean()}`. A parameter is
+  optional (`required: false`) iff **every** occurrence of its name sits
+  inside an `[[ ... ]]` optional group.
+
+      iex> EctoQueryParser.parameters("status == {{status}} [[AND created_at >= {{start}}]]")
+      {:ok, [%{name: "status", required: true}, %{name: "start", required: false}]}
+
+  Returns `{:error, %EctoQueryParser.ParseError{}}` if the string does not
+  parse.
+  """
+  def parameters(query_string) when is_binary(query_string) do
+    with {:ok, ast} <- parse(query_string) do
+      {:ok, EctoQueryParser.Params.list(ast)}
     end
   end
 

@@ -18,6 +18,12 @@ defmodule EctoQueryParser.Parser do
   - IS NOT NULL: `col IS NOT NULL` → `{:is_not_null, {:identifier, "col"}}`
   - BETWEEN: `col BETWEEN 1 AND 10` → `{:between, {:identifier, "col"}, {:integer, 1}, {:integer, 10}}`
   - Grouping: `(a == 1 OR b == 2) AND c == 3` → `{:and, [{:or, [...]}, ...]}`
+  - Parameters: `{{name}}` → `{:param, "name"}` (the name stays a string — no atoms)
+  - Optional groups: `a == 1 [[AND b == {{p}}]]` →
+    `{:and, [op1, {:optional, :and, [op2]}]}`. The connector lives *inside*
+    the brackets; a connector-less `[[expr]]` may start a filter (or an AND
+    chain) and parses as `{:optional, :and, [expr]}`. Optional groups do not
+    nest.
 
   Parse failures return `{:error, %EctoQueryParser.ParseError{}}` with line,
   column, and byte-offset information.
@@ -92,11 +98,28 @@ defmodule EctoQueryParser.Parser do
     |> repeat(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_]))
     |> reduce({__MODULE__, :chars_to_string, []})
 
+  # Parameter placeholder: {{name}}. Valid anywhere a literal may appear.
+  # Whitespace inside the braces is tolerated ({{ status }}). The name is kept
+  # as a plain string — parameters never touch the atom table.
+  param_name =
+    ascii_char([?a..?z, ?A..?Z, ?_])
+    |> repeat(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_]))
+    |> reduce({__MODULE__, :chars_to_string, []})
+
+  param_literal =
+    ignore(string("{{"))
+    |> ignore(whitespace)
+    |> concat(param_name)
+    |> ignore(whitespace)
+    |> ignore(string("}}"))
+    |> unwrap_and_tag(:param)
+
   # Value (non-recursive, used inside lists and functions)
   # We use parsec/1 to handle the recursive nature of lists and functions
   value =
     ignore(whitespace)
     |> choice([
+      param_literal,
       string_literal,
       boolean_literal,
       parsec(:list_value),
@@ -138,6 +161,7 @@ defmodule EctoQueryParser.Parser do
   operand =
     ignore(whitespace)
     |> choice([
+      param_literal,
       string_literal,
       boolean_literal,
       list_literal,
@@ -270,22 +294,129 @@ defmodule EctoQueryParser.Parser do
     ])
     |> ignore(whitespace)
 
-  # AND chains: primary AND primary AND ...
-  # AND binds tighter than OR
-  and_expression =
-    parsec(:primary_expr)
+  # --- Group-free ("ng") expression variants ---
+  #
+  # Optional groups do not nest, so the content of a `[[ ... ]]` group is
+  # parsed with this parallel set of combinators, which mirror the main
+  # primary/AND/OR chain but exclude the optional-group branches (including
+  # through parentheses).
+  ng_negation =
+    not_keyword
+    |> parsec(:ng_primary_expr)
+    |> reduce({__MODULE__, :build_not, []})
+
+  ng_grouped =
+    ignore(string("("))
+    |> ignore(whitespace)
+    |> parsec(:ng_or_expr)
+    |> ignore(whitespace)
+    |> ignore(string(")"))
+
+  ng_primary =
+    ignore(whitespace)
+    |> choice([
+      ng_negation,
+      ng_grouped,
+      between_expression,
+      is_null_expression,
+      operator_expression,
+      operand
+    ])
+    |> ignore(whitespace)
+
+  ng_and_expression =
+    parsec(:ng_primary_expr)
     |> repeat(
       and_connector
-      |> parsec(:primary_expr)
+      |> parsec(:ng_primary_expr)
     )
     |> reduce({__MODULE__, :build_and, []})
 
-  # OR chains: and_expr OR and_expr OR ...
+  ng_or_expression =
+    parsec(:ng_and_expr)
+    |> repeat(
+      or_connector
+      |> parsec(:ng_and_expr)
+    )
+    |> reduce({__MODULE__, :build_or, []})
+
+  # --- Optional groups: [[ ... ]] ---
+  #
+  # A group carries its boolean connector *inside* the brackets and attaches
+  # to the surrounding chain at that connector's precedence level:
+  #
+  #     a == 1 [[AND b == {{p}}]]      (AND chain)
+  #     a == 1 [[OR b == {{p}}]]       (OR chain)
+  #
+  # A connector-less group may additionally appear where an expression begins
+  # (most usefully as the whole filter): `[[status == {{s}}]]`. The AST node
+  # is {:optional, :and | :or, items}; when every {{param}} inside is bound
+  # the items splice into the surrounding connector list, otherwise the whole
+  # group is pruned (see EctoQueryParser.Params).
+  and_group =
+    ignore(whitespace)
+    |> ignore(string("[["))
+    |> ignore(whitespace)
+    |> concat(and_connector)
+    |> parsec(:ng_primary_expr)
+    |> repeat(
+      and_connector
+      |> parsec(:ng_primary_expr)
+    )
+    |> ignore(string("]]"))
+    |> ignore(whitespace)
+    |> reduce({__MODULE__, :to_and_group, []})
+
+  or_group =
+    ignore(whitespace)
+    |> ignore(string("[["))
+    |> ignore(whitespace)
+    |> concat(or_connector)
+    |> parsec(:ng_and_expr)
+    |> repeat(
+      or_connector
+      |> parsec(:ng_and_expr)
+    )
+    |> ignore(string("]]"))
+    |> ignore(whitespace)
+    |> reduce({__MODULE__, :to_or_group, []})
+
+  bare_group =
+    ignore(whitespace)
+    |> ignore(string("[["))
+    |> ignore(whitespace)
+    |> parsec(:ng_or_expr)
+    |> ignore(string("]]"))
+    |> ignore(whitespace)
+    |> reduce({__MODULE__, :to_bare_group, []})
+
+  # AND chains: primary AND primary AND ...
+  # AND binds tighter than OR. The chain may start with a connector-less
+  # optional group and may be continued by [[AND ...]] groups. Plain
+  # `AND primary` is tried before the group branch so existing syntax
+  # (including nested list literals like `[[1], [2]]`) keeps parsing the same.
+  and_expression =
+    choice([
+      bare_group,
+      parsec(:primary_expr)
+    ])
+    |> repeat(
+      choice([
+        and_connector |> parsec(:primary_expr),
+        and_group
+      ])
+    )
+    |> reduce({__MODULE__, :build_and, []})
+
+  # OR chains: and_expr OR and_expr OR ..., optionally continued by
+  # [[OR ...]] groups.
   or_expression =
     parsec(:and_expr)
     |> repeat(
-      or_connector
-      |> parsec(:and_expr)
+      choice([
+        or_connector |> parsec(:and_expr),
+        or_group
+      ])
     )
     |> reduce({__MODULE__, :build_or, []})
 
@@ -294,6 +425,9 @@ defmodule EctoQueryParser.Parser do
   defcombinatorp(:primary_expr, primary)
   defcombinatorp(:and_expr, and_expression)
   defcombinatorp(:or_expr, or_expression)
+  defcombinatorp(:ng_primary_expr, ng_primary)
+  defcombinatorp(:ng_and_expr, ng_and_expression)
+  defcombinatorp(:ng_or_expr, ng_or_expression)
 
   # The label keeps failure messages to a single readable line instead of
   # NimbleParsec's exhaustive multi-kilobyte choice dump; the ParseError's
@@ -384,6 +518,15 @@ defmodule EctoQueryParser.Parser do
 
   @doc false
   def build_not([expr]), do: {:not, expr}
+
+  @doc false
+  def to_and_group(items), do: {:optional, :and, items}
+
+  @doc false
+  def to_or_group(items), do: {:optional, :or, items}
+
+  @doc false
+  def to_bare_group([inner]), do: {:optional, :and, [inner]}
 
   @doc false
   def build_and([single]), do: single
