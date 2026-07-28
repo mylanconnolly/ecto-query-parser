@@ -424,7 +424,9 @@ defmodule EctoQueryParser.Parser do
   defcombinatorp(:list_value, list_literal)
   defcombinatorp(:primary_expr, primary)
   defcombinatorp(:and_expr, and_expression)
-  defcombinatorp(:or_expr, or_expression)
+  # Public so the pipe grammar (EctoQueryParser.Pipe.Parser) can embed the
+  # filter grammar verbatim via parsec({EctoQueryParser.Parser, :or_expr}).
+  defcombinator(:or_expr, or_expression)
   defcombinatorp(:ng_primary_expr, ng_primary)
   defcombinatorp(:ng_and_expr, ng_and_expression)
   defcombinatorp(:ng_or_expr, ng_or_expression)
@@ -450,23 +452,17 @@ defmodule EctoQueryParser.Parser do
         {:ok, result}
 
       {:ok, _, rest, _, position, byte_offset} ->
-        {:error, parse_error("unexpected input: #{inspect(rest)}", rest, position, byte_offset)}
+        {:error,
+         EctoQueryParser.ParseError.from_nimble(
+           "unexpected input: #{inspect(truncate(rest))}",
+           rest,
+           position,
+           byte_offset
+         )}
 
       {:error, reason, rest, _context, position, byte_offset} ->
-        {:error, parse_error(reason, rest, position, byte_offset)}
+        {:error, EctoQueryParser.ParseError.from_nimble(reason, rest, position, byte_offset)}
     end
-  end
-
-  # NimbleParsec reports position as {line, byte offset at which the line
-  # starts}; the column is derived from the distance into that line.
-  defp parse_error(reason, rest, {line, line_start_offset}, byte_offset) do
-    %EctoQueryParser.ParseError{
-      message: reason,
-      line: line,
-      column: byte_offset - line_start_offset + 1,
-      byte_offset: byte_offset,
-      rest: truncate(rest)
-    }
   end
 
   defp truncate(rest) when byte_size(rest) <= @max_rest_length, do: rest

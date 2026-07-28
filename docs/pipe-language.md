@@ -55,15 +55,24 @@ no stages is a valid query (`SELECT *` with the caller's row cap).
 - **Table**: an identifier, optionally schema-qualified. Validated against the
   caller's schema/`:allowed_fields` spec exactly as today.
 - **External reference** (`@monthly-revenue`): resolved by a caller-supplied
-  callback:
+  callback. *(Contract refined during implementation — an early sketch split
+  the queryable and its field spec across two return shapes; the shipped
+  contract returns both together, since building filters against an external
+  source always needs its fields:)*
 
   ```elixir
   resolve_source: fn slug ->
-    {:ok, %Ecto.Query{} = q}     # inlined as a subquery source
-    | {:ok, {:fields, fields}}   # plus the field spec of its output
+    {:ok, queryable, fields}   # inlined as a subquery source + the
+                               # allowed_fields-format spec of its output
     | {:error, message}
   end
   ```
+
+  The queryable must be usable as an Ecto subquery (i.e. carry a select, as
+  any schema-based or previously-built query does); `fields` validates and
+  types the stages that follow. A `@slug` without a resolver, a resolver
+  `{:error, message}`, and an off-contract return are all build errors
+  carrying the source token's position.
 
   Slugs are `[a-z0-9][a-z0-9-_]*`. The package never interprets slugs; cycle
   detection, permissions, and lookup are the caller's problem. (This is how a
@@ -106,7 +115,11 @@ Aggregation with optional breakouts:
 ```
 
 - Breakouts: identifiers or function applications (temporal bucketing via the
-  existing `ROUND_*` functions).
+  existing `ROUND_*` functions). *(Implementation refinement:)* a function
+  breakout may be aliased (`month = ROUND_MONTH(inserted_at)`); un-aliased
+  function breakouts get a derived, identifier-shaped name
+  (`round_month_inserted_at`) so later `sort`/`filter` stages can reference
+  them.
 - Aggregations: `count()`, `count(col)`, `count_distinct(col)`, `sum(col)`,
   `avg(col)`, `min(col)`, `max(col)`. Every aggregation must be aliased —
   aliases become the output column names.
@@ -197,10 +210,19 @@ Range semantics per comparison operator, given `{:range, {lo, hi}}`:
 
 - Parse failures: `%EctoQueryParser.ParseError{message, line, column,
   byte_offset, rest}` (since v0.4.0).
-- From the stage release onward, AST nodes carry source positions, and
-  build/validation errors (`unknown field`, `field not allowed`, bad
-  aggregation alias, …) return a positioned error struct too — so editors can
-  underline the offending token, not just parse failures.
+- From the stage release onward, pipe-grammar AST nodes (identifiers,
+  aliases, stage keywords, the source) carry source positions, and
+  stage-level validation errors (`unknown column`, `field not allowed`, bad
+  aggregation alias, plural association outside a filter, unresolvable
+  `@ref`, duplicate `limit`, …) return a positioned
+  `%EctoQueryParser.ValidationError{message, line, column, byte_offset,
+  stage, stage_index}` — so editors can underline the offending token, not
+  just parse failures.
+- *Boundary (as shipped):* errors arising **inside** a `filter` stage's
+  boolean expression (unknown field, unbound parameter, …) keep the plain
+  `{:error, binary}` shape, prefixed with `"in filter stage N: "` — the
+  filter grammar's AST predates positions and does not carry per-token
+  offsets. Positioning those is a candidate follow-up.
 
 ## Compilation model
 
@@ -216,14 +238,17 @@ Postgres remains the only target (fragments: `ILIKE`, `DATE_TRUNC`,
 
 ## Release roadmap
 
-- **v0.5.0 — parameters.** `{{name}}` nodes, `[[optional]]` groups,
-  `parameters/1` discovery, `params:` build option, `literal_transform:` hook.
-  Filter-only surface (the pipe grammar is not yet exposed).
-- **v0.6.0 — the pipe language.** Source + stage grammar (`filter`, `select`,
-  `group`, `sort`, `limit`/`offset`), staged compilation, `@slug` +
-  `resolve_source:`, positioned validation errors.
-- **v0.7+ — candidates.** `derive` (computed columns), explicit `join`,
-  `distinct`, window functions, percentile aggregations, non-Postgres dialects.
+- **v0.5.0 — parameters AND the pipe language.** `{{name}}` nodes,
+  `[[optional]]` groups, `parameters/1` discovery, `params:` build option,
+  `literal_transform:` hook — plus the full pipe language: source + stage
+  grammar (`filter`, `select`, `group`, `sort`, `limit`/`offset`), staged
+  compilation, `@slug` + `resolve_source:`, positioned validation errors.
+  *(Maintainer decision, 2026-07-28: the pipe language was originally slated
+  for v0.6.0, but with 0.5.0 still unpublished it was folded in to avoid two
+  same-day releases.)*
+- **v0.6+ — candidates.** `derive` (computed columns), explicit `join`,
+  `distinct`, window functions, percentile aggregations, non-Postgres
+  dialects, positioned errors inside filter expressions.
 
 ## Decisions log
 
@@ -234,3 +259,6 @@ Postgres remains the only target (fragments: `ILIKE`, `DATE_TRUNC`,
 | 2026-07-28 | Parameters are `{{name}}` + `[[optional]]`, identical to the raw-SQL template dialect |
 | 2026-07-28 | `limit`/`offset` take integer literals only, never parameters |
 | 2026-07-28 | Optional groups: filter stages only, no nesting |
+| 2026-07-28 | Pipe language ships in v0.5.0 alongside parameters (0.5.0 unpublished; avoid two same-day releases) |
+| 2026-07-28 | Resolver contract: `fn slug -> {:ok, queryable, fields} \| {:error, message}` — queryable and field spec returned together |
+| 2026-07-28 | Projection output columns are positional atoms `:c0..:c63` (max 64/stage) with a name→key rename map returned to the caller; input-derived aliases never become atoms |

@@ -269,6 +269,16 @@ defmodule EctoQueryParser.Builder do
   # Fallback: try as an expression (standalone values)
   defp to_dynamic(ast, opts), do: to_expr(ast, opts)
 
+  # Value-level entry points for the pipe compiler: it evaluates identifiers
+  # and function applications outside a boolean context (select columns,
+  # group breakouts, aggregation arguments, sort keys) and needs the same
+  # resolution rules (allowlist, dotted paths, joins) the filter builder uses.
+  @doc false
+  def expr(ast, opts), do: to_expr(ast, opts)
+
+  @doc false
+  def type_of(ast, opts), do: field_type(ast, opts)
+
   # --- Value-level expressions ---
 
   defp to_expr({:string, v}, _opts), do: {:ok, dynamic([row], ^v), []}
@@ -305,7 +315,7 @@ defmodule EctoQueryParser.Builder do
     case Map.fetch(@date_trunc_functions, name) do
       {:ok, unit} ->
         with {:ok, a, joins} <- to_expr(arg, opts) do
-          {:ok, dynamic([row], fragment("DATE_TRUNC(?, ?)", ^unit, ^a)), joins}
+          {:ok, date_trunc(unit, a), joins}
         end
 
       :error ->
@@ -316,6 +326,21 @@ defmodule EctoQueryParser.Builder do
   defp to_expr({:function, name, args}, opts) do
     eval_standard_function(name, args, opts)
   end
+
+  # The unit is inlined as a SQL literal rather than bound as a parameter:
+  # it comes from the fixed internal @date_trunc_functions map (never from
+  # input), and inlining keeps the expression textually identical wherever it
+  # is repeated — Postgres requires a grouped SELECT expression to match the
+  # GROUP BY expression, which `DATE_TRUNC($1, ...)` vs `DATE_TRUNC($2, ...)`
+  # placeholders would break.
+  defp date_trunc("second", a), do: dynamic([row], fragment("DATE_TRUNC('second', ?)", ^a))
+  defp date_trunc("minute", a), do: dynamic([row], fragment("DATE_TRUNC('minute', ?)", ^a))
+  defp date_trunc("hour", a), do: dynamic([row], fragment("DATE_TRUNC('hour', ?)", ^a))
+  defp date_trunc("day", a), do: dynamic([row], fragment("DATE_TRUNC('day', ?)", ^a))
+  defp date_trunc("week", a), do: dynamic([row], fragment("DATE_TRUNC('week', ?)", ^a))
+  defp date_trunc("month", a), do: dynamic([row], fragment("DATE_TRUNC('month', ?)", ^a))
+  defp date_trunc("quarter", a), do: dynamic([row], fragment("DATE_TRUNC('quarter', ?)", ^a))
+  defp date_trunc("year", a), do: dynamic([row], fragment("DATE_TRUNC('year', ?)", ^a))
 
   defp eval_standard_function(name, args, opts) do
     case Map.fetch(@function_names, name) do

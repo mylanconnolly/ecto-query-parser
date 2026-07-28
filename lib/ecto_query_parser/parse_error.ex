@@ -33,4 +33,23 @@ defmodule EctoQueryParser.ParseError do
   def message(%__MODULE__{message: message, line: line, column: column}) do
     "parse error at line #{line}, column #{column}: #{message}"
   end
+
+  @max_rest_length 60
+
+  # Builds a ParseError from NimbleParsec's failure data. NimbleParsec
+  # reports position as {line, byte offset at which the line starts}; the
+  # column is derived from the distance into that line.
+  @doc false
+  def from_nimble(reason, rest, {line, line_start_offset}, byte_offset) do
+    %__MODULE__{
+      message: reason,
+      line: line,
+      column: byte_offset - line_start_offset + 1,
+      byte_offset: byte_offset,
+      rest: truncate(rest)
+    }
+  end
+
+  defp truncate(rest) when byte_size(rest) <= @max_rest_length, do: rest
+  defp truncate(rest), do: String.slice(rest, 0, @max_rest_length) <> "..."
 end

@@ -3,7 +3,9 @@
 A query language parser for Ecto that converts human-readable filter strings into
 Ecto `WHERE` clauses. Useful for building user-facing search and filtering
 interfaces where the filter expression comes from a URL parameter, API request
-body, or other untrusted text input.
+body, or other untrusted text input. It also ships a staged
+[pipe language](#pipe-language) (`source | filter … | group … | sort … | limit N`)
+for building whole BI-style queries from untrusted text.
 
 ```elixir
 iex> EctoQueryParser.apply(Post, ~s{status == "published" AND author.name contains "alice"})
@@ -191,6 +193,157 @@ Functions are case-insensitive and can be nested.
 
 The `ROUND_*` family includes: `ROUND_SECOND`, `ROUND_MINUTE`, `ROUND_HOUR`,
 `ROUND_DAY`, `ROUND_WEEK`, `ROUND_MONTH`, `ROUND_QUARTER`, `ROUND_YEAR`.
+
+## Pipe language
+
+Beyond single filter strings, the package parses a staged **pipe language** —
+a text query language for BI-style tools where end users type whole queries
+(projection, aggregation, ordering) against allowlist-bounded schemas. A pipe
+query is a source plus a flat list of `|`-separated stages; whitespace and
+newlines around `|` are insignificant:
+
+```
+orders
+| filter status == "paid" AND created_at >= "last month"
+| group customer.region {
+    total = sum(amount),
+    n = count()
+  }
+| sort -total
+| limit 10
+```
+
+```elixir
+{:ok, query, columns} =
+  EctoQueryParser.build_pipe(text,
+    allowed_fields: [status: :string, amount: :integer, created_at: :utc_datetime,
+                     customer: {:belongs_to, table: "customers", owner_key: :customer_id,
+                                related_key: :id, fields: [region: :string]}],
+    literal_transform: my_date_transform
+  )
+
+columns
+#=> [%{name: "customer.region", key: :c0}, %{name: "total", key: :c1}, %{name: "n", key: :c2}]
+
+Repo.all(query)
+#=> [%{c0: "north", c1: 1200, c2: 8}, ...]
+```
+
+Use `EctoQueryParser.parse_pipe/1` to parse without building (e.g. to inspect
+the query's source), and `EctoQueryParser.parameters/1` works on pipe texts
+too (parameters may appear in any `filter` stage).
+
+### Stages
+
+| Stage | Example | Description |
+|-------|---------|-------------|
+| `filter <expr>` | `filter status == "paid" AND age >= {{min}}` | The full filter grammar, verbatim — operators, functions, association paths (JOIN/EXISTS), JSONB paths, `{{params}}`, `[[optional]]` groups. Multiple `filter` stages allowed. After a `group`/`select`, filters address the previous stage's *output* (HAVING semantics for free). |
+| `select col, ...` | `select name, customer.region, upper_name = UPPER(name)` | Projection. Columns are identifiers (association paths, singular-only) or `alias = FUNC(...)` using the existing function set. Later stages see only the selected columns. |
+| `group breakouts { aggs }` | `group region { total = sum(amount), n = count() }` | Aggregation. Breakouts are identifiers, function applications (`ROUND_*` temporal bucketing), or `alias = FUNC(...)`; aggregations are `count()`, `count(col)`, `count_distinct(col)`, `sum(col)`, `avg(col)`, `min(col)`, `max(col)`, each aliased. `group { ... }` with no breakouts is a single-row summary. Output shape = breakouts then aliases. |
+| `sort key, ...` | `sort -total, region` | `-key` sorts descending. After a `group`, keys refer to the grouped output, aliases included. A later `sort` replaces an earlier one. |
+| `limit N` / `offset N` | `limit 10` | Non-negative integer literals only (never parameters); at most one of each per query. Row capping stays the caller's job — apply your hard cap to the returned query. |
+
+Stage keywords are lowercase. An un-aliased function breakout gets a derived,
+referenceable name (`ROUND_MONTH(created_at)` → `round_month_created_at`);
+alias it (`month = ROUND_MONTH(created_at)`) for a nicer one. Aliases must
+not collide with each other or with breakout/column names.
+
+### Output columns
+
+Aliases come from untrusted input and are **never converted to atoms**
+(Ecto's map selects and subqueries need atom keys, and hostile unique aliases
+would otherwise exhaust the atom table). Instead, every projection stage
+selects into positional keys `:c0`, `:c1`, … (at most 64 columns per stage),
+and `build_pipe/2` returns the ordered name→key mapping so you can rename
+result rows. Queries with no projection stage return `nil` columns and keep
+the source's row shape — note a schemaless table source then has no select
+clause, so attach one before executing.
+
+### Staged compilation
+
+Stages fold left-to-right onto one Ecto query. A stage that must address the
+previous stage's *output* (the first filter/select/group/sort after a
+projection, or any of those after `limit`/`offset`) wraps the accumulated
+query in a subquery; consecutive same-shape stages share a level (two
+adjacent filters are two WHERE clauses, no nesting). This is how `filter`
+after `group` becomes HAVING semantics without a special case:
+
+```
+orders | group region { total = sum(amount) } | filter total > 100
+```
+
+```sql
+SELECT s0."c0", s0."c1" FROM (
+  SELECT o0."region" AS "c0", sum(o0."amount") AS "c1"
+  FROM "orders" AS o0 GROUP BY o0."region"
+) AS s0 WHERE s0."c1" > $1
+```
+
+Grouped output columns keep type information (breakouts keep the underlying
+field's type; `sum`/`min`/`max` keep their argument's), so literal coercion
+and `literal_transform` keep working in post-group filters.
+
+### Sources and `@references`
+
+A **table source** (`orders`, or schema-qualified `sales.orders`, which sets
+the query prefix) compiles to a schemaless `from`. The table name itself is
+not validated — parse first, check `source` against your catalog, then build
+with that table's field spec:
+
+```elixir
+{:ok, %EctoQueryParser.Pipe.Query{source: {:table, "orders", _pos}}} =
+  EctoQueryParser.parse_pipe(text)
+```
+
+An **external reference** (`@monthly-revenue`; slugs are
+`[a-z0-9][a-z0-9-_]*`) is resolved through the `:resolve_source` option —
+this is how a BI app implements "query another saved question". The resolver
+receives the slug and returns the queryable *and* its output field spec (in
+`:allowed_fields` format), so stages can be validated and typed against it:
+
+```elixir
+resolve_source: fn slug ->
+  case MyApp.Questions.fetch(slug) do
+    {:ok, question} -> {:ok, question.query, question.fields}
+    :error -> {:error, "no such question"}
+  end
+end
+
+EctoQueryParser.build_pipe("@monthly-revenue | filter total > 100 | sort -total",
+  resolve_source: resolver)
+```
+
+The resolved queryable is inlined as a subquery source (it must carry a
+select, as any schema-based or previously-built query does). The package
+never interprets slugs — lookup, permissions, and cycle detection are the
+caller's problem. A `@slug` without a resolver is a build error.
+
+### Pipe errors
+
+Parse failures return the usual positioned `%EctoQueryParser.ParseError{}`.
+Stage-level validation failures (unknown column in `select`/`sort`/`group`,
+alias collisions, plural association outside a filter, unresolvable
+`@reference`, more than one `limit`, …) return a positioned
+`%EctoQueryParser.ValidationError{}` — identifiers, aliases, and stage
+keywords carry their source position through the AST, and the error names
+the stage that broke:
+
+```elixir
+{:error, %EctoQueryParser.ValidationError{} = err} =
+  EctoQueryParser.build_pipe("orders | group region { t = sum(amount) } | sort -bogus")
+
+Exception.message(err)
+#=> "invalid query at line 1, column 51 (in sort stage 2): unknown column: bogus (output columns: region, t)"
+```
+
+Errors arising *inside* a `filter` stage's boolean expression (unknown
+field, unbound parameter, …) reuse the existing filter builder and keep
+their plain `{:error, binary}` shape, prefixed with the stage — the filter
+grammar's AST does not carry per-token positions:
+
+```elixir
+{:error, "in filter stage 2: unknown column: age (output columns: name)"}
+```
 
 ## Usage
 

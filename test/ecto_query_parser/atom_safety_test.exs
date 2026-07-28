@@ -130,4 +130,100 @@ defmodule EctoQueryParser.AtomSafetyTest do
     refute_atoms_exist(["schemaless_leaf_640"])
     assert growth < @max_atom_growth
   end
+
+  # --- Pipe language ---
+  #
+  # Projection aliases become output *column names*, which Ecto can only
+  # represent as atoms — so the compiler never uses them as atoms at all: it
+  # selects into the fixed :c0..:c63 key set and returns a name→key mapping.
+  # A hostile flood of unique alias names must therefore SUCCEED (they are
+  # valid queries!) without growing the atom table.
+
+  test "unique aggregation aliases build successfully without creating atoms" do
+    growth =
+      atom_growth(fn i ->
+        assert {:ok, _query, [%{name: name, key: :c0}]} =
+                 EctoQueryParser.build_pipe("items | group { hostile_agg_alias_#{i} = count() }")
+
+        assert name == "hostile_agg_alias_#{i}"
+      end)
+
+    refute_atoms_exist(["hostile_agg_alias_512"])
+    assert growth < @max_atom_growth
+  end
+
+  test "unique select aliases build successfully without creating atoms" do
+    growth =
+      atom_growth(fn i ->
+        assert {:ok, _query, [%{key: :c0}]} =
+                 EctoQueryParser.build_pipe(
+                   "items | select hostile_sel_alias_#{i} = UPPER(name)",
+                   allowed_fields: [name: :string]
+                 )
+      end)
+
+    refute_atoms_exist(["hostile_sel_alias_512"])
+    assert growth < @max_atom_growth
+  end
+
+  test "unique breakout aliases build successfully without creating atoms" do
+    growth =
+      atom_growth(fn i ->
+        assert {:ok, _query, _cols} =
+                 EctoQueryParser.build_pipe(
+                   "items | group hostile_brk_#{i} = ROUND_DAY(created_at) { n = count() } " <>
+                     "| sort -hostile_brk_#{i}",
+                   allowed_fields: [created_at: :utc_datetime]
+                 )
+      end)
+
+    refute_atoms_exist(["hostile_brk_512"])
+    assert growth < @max_atom_growth
+  end
+
+  test "unique table names in pipe sources never become atoms" do
+    growth =
+      atom_growth(fn i ->
+        assert {:ok, _query, nil} = EctoQueryParser.build_pipe("hostile_table_#{i}")
+      end)
+
+    refute_atoms_exist(["hostile_table_512"])
+    assert growth < @max_atom_growth
+  end
+
+  test "unique @slugs stay strings through the resolver" do
+    resolver = fn slug ->
+      assert is_binary(slug)
+      {:error, "unknown"}
+    end
+
+    growth =
+      atom_growth(fn i ->
+        assert {:error, %EctoQueryParser.ValidationError{}} =
+                 EctoQueryParser.build_pipe("@hostile-slug-#{i}", resolve_source: resolver)
+      end)
+
+    refute_atoms_exist(["hostile-slug-512"])
+    assert growth < @max_atom_growth
+  end
+
+  test "unique column names in stages error without creating atoms" do
+    growth =
+      atom_growth(fn i ->
+        # select: positioned validation error
+        assert {:error, %EctoQueryParser.ValidationError{}} =
+                 EctoQueryParser.build_pipe("items | select hostile_pipe_col_#{i}",
+                   allowed_fields: [name: :string]
+                 )
+
+        # filter over grouped output: plain error, names compared as strings
+        assert {:error, "in filter stage 2: unknown column: " <> _} =
+                 EctoQueryParser.build_pipe(
+                   "items | group { n = count() } | filter hostile_had_col_#{i} > 1"
+                 )
+      end)
+
+    refute_atoms_exist(["hostile_pipe_col_512", "hostile_had_col_512"])
+    assert growth < @max_atom_growth
+  end
 end
