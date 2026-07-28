@@ -33,7 +33,9 @@ defmodule EctoQueryParser.Identifier do
   defp classify_segments(first, rest, opts) do
     case lookup(first, opts) do
       {:plural, kind, aopts, sub_opts} ->
-        {:plural, String.to_atom(first), kind, aopts, Enum.join(rest, "."), sub_opts}
+        # Safe: lookup/2 above only classifies as plural when the segment
+        # resolved via String.to_existing_atom/1, so this cannot create atoms.
+        {:plural, String.to_existing_atom(first), kind, aopts, Enum.join(rest, "."), sub_opts}
 
       {:singular, _kind, sub_opts} ->
         case ensure_no_plural(rest, sub_opts, first) do

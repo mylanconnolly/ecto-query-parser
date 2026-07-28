@@ -13,7 +13,14 @@ defmodule EctoQueryParser.Parser do
   - Functions: `TO_UPPER(col)` → `{:function, "to_upper", [{:identifier, "col"}]}`
   - Operators: `col == 1` → `{:op, :==, {:identifier, "col"}, {:integer, 1}}`
   - AND/OR: `a == 1 AND b == 2` → `{:and, [op1, op2]}`
+  - NOT: `NOT a == 1` → `{:not, {:op, :==, ...}}`
+  - IS NULL: `col IS NULL` → `{:is_null, {:identifier, "col"}}`
+  - IS NOT NULL: `col IS NOT NULL` → `{:is_not_null, {:identifier, "col"}}`
+  - BETWEEN: `col BETWEEN 1 AND 10` → `{:between, {:identifier, "col"}, {:integer, 1}, {:integer, 10}}`
   - Grouping: `(a == 1 OR b == 2) AND c == 3` → `{:and, [{:or, [...]}, ...]}`
+
+  Parse failures return `{:error, %EctoQueryParser.ParseError{}}` with line,
+  column, and byte-offset information.
   """
 
   import NimbleParsec
@@ -141,13 +148,16 @@ defmodule EctoQueryParser.Parser do
     ])
     |> ignore(whitespace)
 
-  # Symbolic operators
+  # Symbolic operators. Order matters: ">=" / "<=" must be tried before the
+  # strict ">" / "<" so "age >= 18" never parses as `age > (= 18)`.
   symbolic_operator =
     choice([
       string("==") |> replace(:==),
       string("!=") |> replace(:!=),
       string(">=") |> replace(:>=),
-      string("<=") |> replace(:<=)
+      string("<=") |> replace(:<=),
+      string(">") |> replace(:>),
+      string("<") |> replace(:<)
     ])
 
   # Keyword operator: must not be followed by identifier characters
@@ -160,7 +170,8 @@ defmodule EctoQueryParser.Parser do
       choice([string("contains"), string("CONTAINS")]) |> replace(:contains),
       choice([string("ilike"), string("ILIKE")]) |> replace(:ilike),
       choice([string("like"), string("LIKE")]) |> replace(:like),
-      choice([string("search"), string("SEARCH")]) |> replace(:search)
+      choice([string("search"), string("SEARCH")]) |> replace(:search),
+      choice([string("in"), string("IN")]) |> replace(:in)
     ])
     |> concat(not_ident_char)
 
@@ -186,6 +197,55 @@ defmodule EctoQueryParser.Parser do
     ignore(choice([string("OR"), string("or")]))
     |> concat(not_ident_char)
 
+  # NOT / IS / NULL / BETWEEN keywords, same casing convention as AND/OR
+  # (all-uppercase or all-lowercase, never followed by identifier chars)
+  not_keyword =
+    ignore(choice([string("NOT"), string("not")]))
+    |> concat(not_ident_char)
+
+  is_keyword =
+    ignore(choice([string("IS"), string("is")]))
+    |> concat(not_ident_char)
+
+  between_keyword =
+    ignore(choice([string("BETWEEN"), string("between")]))
+    |> concat(not_ident_char)
+
+  # IS NULL / IS NOT NULL: postfix on an operand (identifier or function call)
+  is_null_expression =
+    operand
+    |> ignore(is_keyword)
+    |> ignore(whitespace)
+    |> choice([
+      choice([string("NOT"), string("not")])
+      |> concat(not_ident_char)
+      |> ignore(whitespace)
+      |> concat(choice([string("NULL"), string("null")]))
+      |> concat(not_ident_char)
+      |> replace(:is_not_null),
+      choice([string("NULL"), string("null")])
+      |> concat(not_ident_char)
+      |> replace(:is_null)
+    ])
+    |> reduce({__MODULE__, :to_null_check, []})
+
+  # BETWEEN: `expr BETWEEN low AND high` parsed as one unit so the inner AND
+  # binds to BETWEEN rather than acting as a logical connector.
+  between_expression =
+    operand
+    |> ignore(between_keyword)
+    |> concat(operand)
+    |> ignore(and_connector)
+    |> concat(operand)
+    |> reduce({__MODULE__, :to_between, []})
+
+  # NOT: unary logical negation of a primary expression.
+  # Precedence: NOT > AND > OR.
+  negation =
+    not_keyword
+    |> parsec(:primary_expr)
+    |> reduce({__MODULE__, :build_not, []})
+
   # Grouped expression: ( or_expression )
   grouped =
     ignore(string("("))
@@ -194,11 +254,17 @@ defmodule EctoQueryParser.Parser do
     |> ignore(whitespace)
     |> ignore(string(")"))
 
-  # Primary: grouped expression, comparison, or standalone value
+  # Primary: negation, grouped expression, comparison, or standalone value.
+  # Multi-token forms (BETWEEN, IS NULL, operator expressions) must be tried
+  # before the bare operand, since choice/1 commits to the first branch that
+  # succeeds.
   primary =
     ignore(whitespace)
     |> choice([
+      negation,
       grouped,
+      between_expression,
+      is_null_expression,
       operator_expression,
       operand
     ])
@@ -228,24 +294,51 @@ defmodule EctoQueryParser.Parser do
   defcombinatorp(:primary_expr, primary)
   defcombinatorp(:and_expr, and_expression)
   defcombinatorp(:or_expr, or_expression)
-  defparsec(:parse_raw, or_expression |> eos())
+
+  # The label keeps failure messages to a single readable line instead of
+  # NimbleParsec's exhaustive multi-kilobyte choice dump; the ParseError's
+  # line/column/rest carry the precise diagnostics.
+  defparsec(:parse_raw, label(or_expression, "a filter expression") |> eos())
+
+  @max_rest_length 60
 
   @doc """
   Parses an input string into an AST node.
 
-  Returns `{:ok, ast_node}` on success or `{:error, reason}` on failure.
+  Returns `{:ok, ast_node}` on success or
+  `{:error, %EctoQueryParser.ParseError{}}` on failure. The error struct
+  carries the 1-based `line` and `column`, the `byte_offset`, and the
+  (truncated) unconsumed `rest` of the input.
   """
   def parse(input) when is_binary(input) do
     case parse_raw(input) do
       {:ok, [result], "", _, _, _} ->
         {:ok, result}
 
-      {:ok, _, rest, _, _, _} ->
-        {:error, "unexpected input: #{inspect(rest)}"}
+      {:ok, _, rest, _, position, byte_offset} ->
+        {:error, parse_error("unexpected input: #{inspect(rest)}", rest, position, byte_offset)}
 
-      {:error, reason, _rest, _context, _position, _byte_offset} ->
-        {:error, reason}
+      {:error, reason, rest, _context, position, byte_offset} ->
+        {:error, parse_error(reason, rest, position, byte_offset)}
     end
+  end
+
+  # NimbleParsec reports position as {line, byte offset at which the line
+  # starts}; the column is derived from the distance into that line.
+  defp parse_error(reason, rest, {line, line_start_offset}, byte_offset) do
+    %EctoQueryParser.ParseError{
+      message: reason,
+      line: line,
+      column: byte_offset - line_start_offset + 1,
+      byte_offset: byte_offset,
+      rest: truncate(rest)
+    }
+  end
+
+  defp truncate(rest) when byte_size(rest) <= @max_rest_length, do: rest
+
+  defp truncate(rest) do
+    String.slice(rest, 0, @max_rest_length) <> "..."
   end
 
   @doc false
@@ -281,6 +374,16 @@ defmodule EctoQueryParser.Parser do
   def to_operator([left, op, right]) do
     {:op, op, left, right}
   end
+
+  @doc false
+  def to_null_check([operand, :is_null]), do: {:is_null, operand}
+  def to_null_check([operand, :is_not_null]), do: {:is_not_null, operand}
+
+  @doc false
+  def to_between([target, low, high]), do: {:between, target, low, high}
+
+  @doc false
+  def build_not([expr]), do: {:not, expr}
 
   @doc false
   def build_and([single]), do: single

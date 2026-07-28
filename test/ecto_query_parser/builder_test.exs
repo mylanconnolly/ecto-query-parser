@@ -42,6 +42,177 @@ defmodule EctoQueryParser.BuilderTest do
     test "<= operator" do
       assert {:ok, _query} = build("score <= 9.99")
     end
+
+    test "> operator" do
+      assert {:ok, query} = build("age > 18")
+      assert inspect(query) =~ "age > ^18"
+    end
+
+    test "< operator" do
+      assert {:ok, query} = build("score < 9.99")
+      assert inspect(query) =~ "score < ^9.99"
+    end
+
+    test "> coerces literal against typed field" do
+      assert {:ok, query} = build(~s{performed_on > "2026-05-20"})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ ":date"
+    end
+
+    test "> works on association paths" do
+      assert {:ok, query} = build(~s{author.hired_on > "2026-01-01"})
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ ":date"
+    end
+  end
+
+  describe "NOT operator" do
+    test "negates a comparison" do
+      assert {:ok, query} = build(~s{NOT name == "alice"})
+      assert inspect(query) =~ "not (" or inspect(query) =~ "not("
+    end
+
+    test "negates a grouped expression" do
+      assert {:ok, query} = build(~s{NOT (role == "admin" OR role == "mod")})
+      query_str = inspect(query)
+      assert query_str =~ "not "
+      assert query_str =~ " or "
+    end
+
+    test "NOT on plural association produces NOT EXISTS" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(
+                 EctoQueryParser.Test.Author,
+                 ~s{NOT posts.name == "x"}
+               )
+
+      query_str = inspect(query)
+      assert query_str =~ "not exists("
+    end
+  end
+
+  describe "IS NULL / IS NOT NULL" do
+    test "IS NULL on a plain field" do
+      assert {:ok, query} = build("name IS NULL")
+      assert inspect(query) =~ "is_nil"
+    end
+
+    test "IS NOT NULL on a plain field" do
+      assert {:ok, query} = build("name IS NOT NULL")
+      assert inspect(query) =~ "not is_nil"
+    end
+
+    test "IS NULL on an association path adds the join" do
+      assert {:ok, query} = build("author.name IS NULL")
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ "is_nil"
+    end
+
+    test "IS NULL on a function expression" do
+      assert {:ok, query} = build("TRIM(name) IS NULL")
+      query_str = inspect(query)
+      assert query_str =~ "TRIM"
+      assert query_str =~ "is_nil"
+    end
+
+    test "IS NULL on a plural association goes inside EXISTS" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(EctoQueryParser.Test.Author, "posts.name IS NULL")
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ "is_nil"
+    end
+
+    test "IS NULL respects allowed_fields" do
+      assert {:error, "field not allowed: role"} =
+               build("role IS NULL", allowed_fields: [:name])
+    end
+  end
+
+  describe "IN operator" do
+    test "membership in an integer list" do
+      assert {:ok, query} = build("age IN [1, 2, 3]")
+      assert inspect(query) =~ "age in ^[1, 2, 3]"
+    end
+
+    test "membership in a string list" do
+      assert {:ok, query} = build(~s{status in ["a", "b"]})
+      assert inspect(query) =~ ~s|status in ^["a", "b"]|
+    end
+
+    test "coerces list elements against the field type" do
+      assert {:ok, query} = build(~s{performed_on IN ["2026-01-01", "2026-01-02"]})
+      query_str = inspect(query)
+      assert query_str =~ "type("
+      assert query_str =~ "{:array, :date}"
+    end
+
+    test "no coercion when element types already match" do
+      assert {:ok, query} = build("age IN [1, 2]")
+      refute inspect(query) =~ "type("
+    end
+
+    test "works on association paths" do
+      assert {:ok, query} = build(~s{author.name IN ["alice", "bob"]})
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ " in ^"
+    end
+
+    test "non-list value errors" do
+      assert {:error, msg} = build("age IN 5")
+      assert msg =~ "IN operator requires a list value"
+    end
+  end
+
+  describe "BETWEEN operator" do
+    test "expands to >= AND <=" do
+      assert {:ok, query} = build("age BETWEEN 1 AND 10")
+      query_str = inspect(query)
+      assert query_str =~ "age >= ^1"
+      assert query_str =~ "age <= ^10"
+    end
+
+    test "coerces both bounds against the field type" do
+      assert {:ok, query} = build(~s{performed_on BETWEEN "2026-01-01" AND "2026-02-01"})
+      query_str = inspect(query)
+      assert occurrences(query_str, "type(") == 2
+      assert query_str =~ ":date"
+    end
+
+    test "works on association paths" do
+      assert {:ok, query} = build(~s{author.hired_on BETWEEN "2026-01-01" AND "2026-02-01"})
+      query_str = inspect(query)
+      assert query_str =~ "left_join"
+      assert query_str =~ ">="
+      assert query_str =~ "<="
+    end
+
+    test "works inside boolean expressions" do
+      assert {:ok, query} = build(~s{(age BETWEEN 18 AND 65) AND active == true})
+      query_str = inspect(query)
+      assert query_str =~ ">= ^18"
+      assert query_str =~ "<= ^65"
+    end
+
+    test "BETWEEN on a plural association goes inside EXISTS" do
+      assert {:ok, query} =
+               EctoQueryParser.apply(EctoQueryParser.Test.Author, "posts.age BETWEEN 1 AND 5")
+
+      query_str = inspect(query)
+      assert query_str =~ "exists("
+      assert query_str =~ ">= ^1"
+      assert query_str =~ "<= ^5"
+    end
+
+    test "respects allowed_fields" do
+      assert {:error, "field not allowed: age"} =
+               build("age BETWEEN 1 AND 10", allowed_fields: [:name])
+    end
   end
 
   describe "text operators" do
@@ -268,8 +439,16 @@ defmodule EctoQueryParser.BuilderTest do
   end
 
   describe "error cases" do
-    test "parse error" do
-      assert {:error, _reason} = build("")
+    test "parse failures propagate as ParseError structs through apply/3" do
+      assert {:error, %EctoQueryParser.ParseError{}} = build("")
+      assert {:error, %EctoQueryParser.ParseError{} = err} = build(~s{name == "alice" AND})
+      assert err.line == 1
+      assert Exception.message(err) =~ "column"
+    end
+
+    test "builder errors keep the binary error shape" do
+      assert {:error, reason} = build(~s{nonexistent_field_xyz == "x"})
+      assert is_binary(reason)
     end
 
     test "unknown field" do
@@ -1092,6 +1271,103 @@ defmodule EctoQueryParser.BuilderTest do
 
       assert query.from.as == :__eqp_source
       assert inspect(query) =~ "parent_as(:__eqp_source)"
+    end
+  end
+
+  describe "atom exhaustion resistance (security)" do
+    # The filter language exists to process untrusted input, so no code path
+    # may call String.to_atom/1 on it: a hostile stream of unique identifiers
+    # would otherwise exhaust the BEAM atom table and crash the node. Each
+    # test hammers a resolution path with unique names and asserts the atom
+    # table stays (nearly) constant — a small constant delta is tolerated for
+    # atoms created lazily by unrelated runtime code.
+    @hostile_rounds 1000
+    @max_atom_growth 50
+
+    defp atom_growth(fun) do
+      before = :erlang.system_info(:atom_count)
+      fun.()
+      :erlang.system_info(:atom_count) - before
+    end
+
+    test "unique dotted association paths error without creating atoms" do
+      growth =
+        atom_growth(fn ->
+          for i <- 1..@hostile_rounds do
+            assert {:error, _} = build("hostile_assoc_#{i}.hostile_field_#{i} == 1")
+          end
+        end)
+
+      assert growth < @max_atom_growth
+    end
+
+    test "unique leaf fields on a real association error without creating atoms" do
+      growth =
+        atom_growth(fn ->
+          for i <- 1..@hostile_rounds do
+            assert {:error, _} = build("author.hostile_leaf_#{i} == 1")
+          end
+        end)
+
+      assert growth < @max_atom_growth
+    end
+
+    test "unique JSON path keys build successfully without creating atoms" do
+      growth =
+        atom_growth(fn ->
+          for i <- 1..@hostile_rounds do
+            assert {:ok, _} = build(~s{metadata.hostile_key_#{i} == "x"})
+          end
+        end)
+
+      assert growth < @max_atom_growth
+    end
+
+    test "unique single-segment identifiers error without creating atoms" do
+      growth =
+        atom_growth(fn ->
+          for i <- 1..@hostile_rounds do
+            assert {:error, _} = build("hostile_field_#{i} == 1")
+          end
+        end)
+
+      assert growth < @max_atom_growth
+    end
+
+    test "unique dotted paths against an allowlist error without creating atoms" do
+      growth =
+        atom_growth(fn ->
+          for i <- 1..@hostile_rounds do
+            assert {:error, "field not allowed: " <> _} =
+                     build("hostile_a_#{i}.hostile_b_#{i} == 1",
+                       allowed_fields: [name: :string, metadata: :map]
+                     )
+          end
+        end)
+
+      assert growth < @max_atom_growth
+    end
+
+    test "unique dotted paths in schemaless mode error without creating atoms" do
+      import Ecto.Query, only: [from: 1]
+
+      author =
+        {:belongs_to,
+         table: "authors", owner_key: :author_id, related_key: :id, fields: [name: :string]}
+
+      growth =
+        atom_growth(fn ->
+          for i <- 1..@hostile_rounds do
+            assert {:error, _} =
+                     EctoQueryParser.apply(
+                       from("test_items"),
+                       "author.hostile_leaf_#{i} == 1",
+                       allowed_fields: [author: author]
+                     )
+          end
+        end)
+
+      assert growth < @max_atom_growth
     end
   end
 

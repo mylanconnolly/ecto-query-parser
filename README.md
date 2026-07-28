@@ -42,22 +42,37 @@ end
 | `!=` | `status != "banned"` | Inequality |
 | `>=` | `age >= 18` | Greater than or equal |
 | `<=` | `score <= 9.99` | Less than or equal |
+| `>` | `age > 18` | Strictly greater than |
+| `<` | `score < 9.99` | Strictly less than |
+| `IN` | `age IN [18, 21, 65]` | List membership; elements are coerced to the field's type |
+| `BETWEEN` | `age BETWEEN 18 AND 65` | Inclusive range (`>= low AND <= high`); the inner `AND` binds to `BETWEEN` |
+| `IS NULL` | `name IS NULL` | Null check (`is_nil`) |
+| `IS NOT NULL` | `name IS NOT NULL` | Non-null check |
 | `contains` | `name contains "ali"` | Case-insensitive substring match (ILIKE) |
 | `like` | `name like "%ali%"` | SQL LIKE pattern |
 | `ilike` | `name ilike "%ALI%"` | SQL ILIKE pattern |
 | `search` | `body search "elixir programming"` | Splits into words and ANDs ILIKE matches |
 | `includes` | `tags includes "elixir"` | Array containment (`= ANY(...)`) |
 
+All operators work on plain fields, association paths (`author.hired_on
+BETWEEN "2026-01-01" AND "2026-12-31"`), and JSON paths.
+
 ### Logical Operators
 
-Combine conditions with `AND` and `OR` (case-insensitive). Use parentheses for
-grouping. `AND` binds tighter than `OR`.
+Combine conditions with `AND` and `OR`, negate with `NOT`, and use
+parentheses for grouping. Keywords accept all-uppercase or all-lowercase.
+Precedence: `NOT` binds tighter than `AND`, which binds tighter than `OR`.
 
 ```
 name == "alice" AND age >= 18
 role == "admin" OR role == "moderator"
 (role == "admin" OR role == "moderator") AND active == true
+NOT (role == "admin" OR role == "moderator")
+NOT comments.body contains "spam"
 ```
+
+`NOT` on a plural-association predicate produces a `NOT EXISTS` subquery
+("posts with no matching comments").
 
 ### Functions
 
@@ -273,7 +288,23 @@ optionally `:join_prefix` (a schema prefix for the join table).
 
 ### Error Handling
 
-All errors are returned as `{:error, reason}` tuples:
+All errors are returned as `{:error, reason}` tuples.
+
+**Parse failures** (since v0.4.0) return an `EctoQueryParser.ParseError`
+struct carrying position information for editor diagnostics:
+
+```elixir
+{:error, %EctoQueryParser.ParseError{} = err} = EctoQueryParser.parse("a == 1 AND")
+err.line        # 1 (1-based)
+err.column      # 8 (1-based)
+err.byte_offset # 7
+err.rest        # "AND" (unconsumed input, truncated)
+Exception.message(err)
+# => "parse error at line 1, column 8: expected end of string"
+```
+
+**Builder/validation errors** keep their string shape (no source position is
+known at that stage):
 
 ```elixir
 {:error, "field not allowed: secret"}
@@ -282,6 +313,14 @@ All errors are returned as `{:error, reason}` tuples:
 {:error, "unknown function: bogus"}
 {:error, "contains operator requires a string or identifier value, got: ..."}
 ```
+
+### Safety
+
+The library is designed for untrusted input: identifiers are never converted
+to atoms unless they already exist (so hostile input cannot exhaust the BEAM
+atom table), JSON path segments stay plain strings, and `contains` / `search`
+escape LIKE metacharacters. Combine with `:allowed_fields` to control exactly
+what users can filter on.
 
 ## Development
 
