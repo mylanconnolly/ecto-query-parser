@@ -42,7 +42,8 @@ orders
 ```
 query      = source , { "|" stage } ;
 source     = table_ref | external_ref ;
-table_ref  = identifier , [ "." , identifier ] ;      (* orders, sales.orders *)
+table_ref  = table_name , [ "." , table_name ] ;      (* orders, sales.orders *)
+table_name = ident_start , { ident_char | "-" } ;     (* client_5f3-9ab.controls *)
 external_ref = "@" , slug ;                            (* @monthly-revenue *)
 stage      = filter | select | group | sort | limit | offset ;
 ```
@@ -54,6 +55,15 @@ no stages is a valid query (`SELECT *` with the caller's row cap).
 
 - **Table**: an identifier, optionally schema-qualified. Validated against the
   caller's schema/`:allowed_fields` spec exactly as today.
+
+  A table-name segment may contain hyphens, unlike an alias or a column path:
+  it names something that already exists in the database, and real schemas and
+  tables carry characters an unquoted SQL identifier can't — a schema-per-tenant
+  layout naming schemas after UUIDs (`client_559de6a3-0cc8-4813.controls`) is
+  the motivating case. This is unambiguous because a table reference only ever
+  appears in the source position, where there is no arithmetic for a `-` to
+  belong to. A segment must still start like an identifier, so a source can
+  never be read as a negative number.
 - **External reference** (`@monthly-revenue`): resolved by a caller-supplied
   callback. *(Contract refined during implementation — an early sketch split
   the queryable and its field spec across two return shapes; the shipped

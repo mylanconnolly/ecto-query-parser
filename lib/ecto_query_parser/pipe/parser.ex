@@ -45,11 +45,23 @@ defmodule EctoQueryParser.Pipe.Parser do
   ident_start = [?a..?z, ?A..?Z, ?_]
   ident_char = [?a..?z, ?A..?Z, ?0..?9, ?_]
 
-  # Bare identifier segment: no dots. Used for aliases, function names, and
-  # table-name segments.
+  # Bare identifier segment: no dots. Used for aliases and function names.
   bare_name =
     ascii_char(ident_start)
     |> repeat(ascii_char(ident_char))
+    |> reduce({List, :to_string, []})
+
+  # Table-name segment. Unlike an alias, this names something that already
+  # exists in the database, and real schema and table names carry characters an
+  # unquoted SQL identifier can't — a schema-per-tenant layout naming schemas
+  # after UUIDs (`client_559de6a3-0cc8-4813-…`) is the motivating case. Hyphens
+  # are unambiguous here because a table reference only ever appears in the
+  # source position, where there is no arithmetic for a `-` to belong to and
+  # nothing else may begin. The segment still has to *start* like an
+  # identifier, so a source can never be mistaken for a negative number.
+  table_segment =
+    ascii_char(ident_start)
+    |> repeat(ascii_char([?a..?z, ?A..?Z, ?0..?9, ?_, ?-]))
     |> reduce({List, :to_string, []})
 
   # Positioned alias / function name.
@@ -252,8 +264,8 @@ defmodule EctoQueryParser.Pipe.Parser do
     |> post_traverse({:tag_ref, []})
 
   table_ref =
-    bare_name
-    |> optional(string(".") |> concat(bare_name))
+    table_segment
+    |> optional(string(".") |> concat(table_segment))
     |> reduce({Enum, :join, []})
     |> post_traverse({:tag_pos, [:table]})
 
