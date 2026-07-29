@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.1
+
+### Fixed
+
+- **Table names may contain hyphens.** A pipe source segment previously had to
+  be a bare unquoted SQL identifier, so a schema-per-tenant layout that names
+  schemas after UUIDs — `client_559de6a3-0cc8-4813-a9be-9c31a39ab47d.controls`
+  — failed to parse at the first hyphen. Table references only ever appear in
+  the source position, where there is no arithmetic for a `-` to belong to, so
+  hyphens are unambiguous there. A source must still *start* like an
+  identifier, and aliases, column paths, and function names are unchanged.
+
 ## v0.5.0
 
 One release, two headline features: `{{name}}` **parameters** (with

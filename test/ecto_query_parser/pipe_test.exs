@@ -44,6 +44,27 @@ defmodule EctoQueryParser.PipeTest do
       assert query.from.prefix == "sales"
     end
 
+    test "table names may contain hyphens, as real schemas and tables do" do
+      assert {:ok, %PipeQuery{source: {:table, "client_559de6a3-0cc8-4813.controls", _}}} =
+               parse("client_559de6a3-0cc8-4813.controls")
+
+      assert {:ok, %PipeQuery{source: {:table, "audit-log", _}}} = parse("audit-log")
+    end
+
+    test "a hyphenated schema qualifier still sets the prefix" do
+      {:ok, query, nil} = build("client_559de6a3-0cc8-4813.orders")
+      assert query.from.prefix == "client_559de6a3-0cc8-4813"
+    end
+
+    test "a hyphenated source still ends at the pipe" do
+      assert {:ok, %PipeQuery{source: {:table, "audit-log", _}, stages: [_limit]}} =
+               parse("audit-log | limit 10")
+    end
+
+    test "a table name still has to start like an identifier" do
+      assert {:error, %ParseError{column: 1}} = parse("-orders")
+    end
+
     test "@slug source" do
       assert {:ok, %PipeQuery{source: {:ref, "monthly-revenue_2", pos}}} =
                parse("@monthly-revenue_2")
