@@ -209,12 +209,21 @@ defmodule EctoQueryParser do
           "orders | group region { total = sum(amount) } | sort -total")
 
       columns
-      #=> [%{name: "region", key: :c0}, %{name: "total", key: :c1}]
+      #=> [
+      #=>   %{name: "region", key: :c0, field: ["region"]},
+      #=>   %{name: "total", key: :c1, field: nil}
+      #=> ]
 
       Repo.all(query)
       #=> [%{c0: "north", c1: 1200}, ...]
 
   Rows come back keyed by the positional atoms; rename them with `columns`.
+  Each column's `field` is its provenance: the source path a plain
+  projection or breakout reads (`["customer", "region"]` for
+  `customer.region`), carried through later stages that re-project it by
+  name, and `nil` for anything computed — functions and aggregations. It
+  lets a caller map an output column back to its catalog entry (types,
+  labels, descriptions) without re-parsing the query.
   When the pipe has no projection stage (bare source, or filter/sort/limit
   only), the query keeps the source's own row shape and `columns` is `nil` —
   note that a schemaless table source then has no select clause at all, so

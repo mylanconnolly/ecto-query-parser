@@ -75,7 +75,7 @@ defmodule EctoQueryParser.Pipe.Compiler do
       end)
       |> case do
         {:ok, %{mode: :derived} = ctx} ->
-          {:ok, ctx.query, Enum.map(ctx.cols, &%{name: &1.name, key: &1.key})}
+          {:ok, ctx.query, Enum.map(ctx.cols, &%{name: &1.name, key: &1.key, field: &1.field})}
 
         {:ok, ctx} ->
           {:ok, ctx.query, nil}
@@ -330,8 +330,12 @@ defmodule EctoQueryParser.Pipe.Compiler do
 
   # --- Column building (select items / group breakouts) ---
 
-  # Each item resolves to %{name, type, dyn, pos} plus join specs. Positioned
-  # validation errors point at the offending identifier or alias.
+  # Each item resolves to %{name, type, field, dyn, pos} plus join specs.
+  # `field` is the column's provenance — the source path a plain projection
+  # reads (`["customer", "region"]`), carried through later stages that
+  # re-project it by name, and nil for anything computed (functions,
+  # aggregations). Positioned validation errors point at the offending
+  # identifier or alias.
   defp build_columns(items, stage, index, ctx) do
     Enum.reduce_while(items, {:ok, [], []}, fn item, {:ok, cols, joins} ->
       case build_column(item, stage, index, ctx) do
@@ -347,13 +351,13 @@ defmodule EctoQueryParser.Pipe.Compiler do
 
   defp build_column({:pcol, name, pos}, stage, index, ctx) do
     with {:ok, dyn, joins, type} <- resolve_column(name, pos, stage, index, ctx) do
-      {:ok, %{name: name, type: type, dyn: dyn, pos: pos}, joins}
+      {:ok, %{name: name, type: type, field: column_field(name, ctx), dyn: dyn, pos: pos}, joins}
     end
   end
 
   defp build_column({:aliased, alias_name, alias_pos, func}, stage, index, ctx) do
     with {:ok, dyn, joins, type} <- resolve_function(func, stage, index, ctx) do
-      {:ok, %{name: alias_name, type: type, dyn: dyn, pos: alias_pos}, joins}
+      {:ok, %{name: alias_name, type: type, field: nil, dyn: dyn, pos: alias_pos}, joins}
     end
   end
 
@@ -366,9 +370,16 @@ defmodule EctoQueryParser.Pipe.Compiler do
         [fname | for({:pcol, arg_name, _} <- args, do: String.replace(arg_name, ".", "_"))]
         |> Enum.join("_")
 
-      {:ok, %{name: name, type: type, dyn: dyn, pos: pos}, joins}
+      {:ok, %{name: name, type: type, field: nil, dyn: dyn, pos: pos}, joins}
     end
   end
+
+  # Where a plain projection's data comes from. At the base level the
+  # identifier is the source path itself; at a derived level it names a
+  # previous stage's output column, whose provenance carries forward (the
+  # column is known to exist — resolve_column just succeeded).
+  defp column_field(name, %{mode: :base}), do: String.split(name, ".")
+  defp column_field(name, %{mode: :derived} = ctx), do: find_column(ctx.cols, name).field
 
   # --- Aggregations ---
 
@@ -386,7 +397,14 @@ defmodule EctoQueryParser.Pipe.Compiler do
   end
 
   defp build_agg_column({:agg, alias_name, alias_pos, "count", nil}, _index, _ctx) do
-    col = %{name: alias_name, type: :integer, dyn: dynamic([row], count()), pos: alias_pos}
+    col = %{
+      name: alias_name,
+      type: :integer,
+      field: nil,
+      dyn: dynamic([row], count()),
+      pos: alias_pos
+    }
+
     {:ok, col, []}
   end
 
@@ -395,6 +413,7 @@ defmodule EctoQueryParser.Pipe.Compiler do
       col = %{
         name: alias_name,
         type: agg_type(fun, arg_type),
+        field: nil,
         dyn: agg_dynamic(fun, arg_dyn),
         pos: alias_pos
       }
