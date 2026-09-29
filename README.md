@@ -215,8 +215,13 @@ plain `timestamp` columns in the session's `TimeZone` (set it to the zone the
 data is stored in, normally `UTC`); `timestamptz` columns convert as-is. The
 zone is inlined as an escaped SQL constant rather than bound as a parameter,
 so zoned expressions work as `group` breakouts. A cast fails the whole query
-if any row can't convert (`INTEGER("abc")`), and `DATE(...)` on a column
-doesn't use that column's index.
+if any row can't convert (`INTEGER("abc")`).
+
+Comparing `DATE(column)` or `DATE(column, zone)` with a constant date — a
+literal, a bound `Date`, or a `literal_transform` range, including in
+`BETWEEN` — compiles to a range on the raw column (`column >= start of day
+AND column < start of next day`), so an index on the column still applies.
+Comparisons against other columns keep the cast.
 
 ## Pipe language
 

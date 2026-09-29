@@ -3,6 +3,8 @@ defmodule EctoQueryParser.Integration.TypedFunctionsTest do
 
   @moduletag :integration
 
+  import Ecto.Query, only: [select: 3]
+
   alias EctoQueryParser.TestRepo
 
   @allowed [
@@ -144,6 +146,63 @@ defmodule EctoQueryParser.Integration.TypedFunctionsTest do
                )
 
       assert rows == [["early", 0], ["late", 10]]
+    end
+  end
+
+  describe "date() compared to constant dates" do
+    # Each rewritten filter must select exactly what the cast would have.
+    defp cast_names(sql_where, params) do
+      %{rows: rows} =
+        TestRepo.query!(
+          "SELECT name FROM test_items WHERE #{sql_where} ORDER BY name",
+          params
+        )
+
+      List.flatten(rows)
+    end
+
+    test "results match the cast, for every operator" do
+      for {op, sql_op} <- [
+            {"==", "="},
+            {"!=", "<>"},
+            {">=", ">="},
+            {">", ">"},
+            {"<=", "<="},
+            {"<", "<"}
+          ] do
+        assert names(~s[test_items | filter date(created_at) #{op} "2026-01-05"]) ==
+                 cast_names("created_at::date #{sql_op} DATE '2026-01-05'", []),
+               "operator #{op}"
+
+        assert names(
+                 ~s[test_items | filter date(created_at, "America/Chicago") #{op} "2026-01-05"]
+               ) ==
+                 cast_names(
+                   "(created_at AT TIME ZONE 'America/Chicago')::date #{sql_op} DATE '2026-01-05'",
+                   []
+                 ),
+               "zoned operator #{op}"
+      end
+    end
+
+    test "the plan can use an index on the column" do
+      {:ok, query, _} =
+        EctoQueryParser.build_pipe(
+          ~s[test_items | filter date(created_at, "America/Chicago") == {{day}}],
+          allowed_fields: @allowed,
+          params: %{"day" => ~D[2026-01-05]}
+        )
+
+      query = select(query, [t], field(t, :name))
+      {sql, params} = Ecto.Adapters.SQL.to_sql(:all, TestRepo, query)
+
+      # Tiny tables always seq-scan by cost; forbid it so the planner shows
+      # whether an index scan is possible at all.
+      TestRepo.query!("SET LOCAL enable_seqscan = off")
+      %{rows: plan} = TestRepo.query!("EXPLAIN " <> sql, params)
+      plan = Enum.map_join(plan, "\n", &hd/1)
+
+      assert plan =~ "test_items_created_at_index"
     end
   end
 end

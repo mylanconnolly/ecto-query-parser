@@ -130,12 +130,9 @@ defmodule EctoQueryParser.Builder do
   @comparison_ops [:==, :!=, :>=, :<=, :>, :<]
 
   defp to_dynamic({:op, op, left, right}, opts) when op in @comparison_ops do
-    left_type = field_type(left, opts)
-    right_type = field_type(right, opts)
-
-    with {:ok, l, lj} <- resolve_operand(left, right_type, opts),
-         {:ok, r, rj} <- resolve_operand(right, left_type, opts) do
-      compile_comparison(op, l, r, lj ++ rj)
+    case date_comparison_rewrite(op, left, right, opts) do
+      :skip -> compile_comparison_operands(op, left, right, opts)
+      result -> result
     end
   end
 
@@ -194,14 +191,9 @@ defmodule EctoQueryParser.Builder do
   # bound into a range, each bound resolves independently: the low bound
   # takes its range's lo, the high bound takes its range's hi.
   defp to_dynamic({:between, target, low, high}, opts) do
-    target_type = field_type(target, opts)
-
-    with {:ok, t, tj} <- to_expr(target, opts),
-         {:ok, lo_res, loj} <- resolve_operand(low, target_type, opts),
-         {:ok, hi_res, hij} <- resolve_operand(high, target_type, opts) do
-      lo = between_bound(lo_res, :low)
-      hi = between_bound(hi_res, :high)
-      {:ok, dynamic([row], ^t >= ^lo and ^t <= ^hi), tj ++ loj ++ hij}
+    case date_between_rewrite(target, low, high, opts) do
+      :skip -> compile_between(target, low, high, opts)
+      result -> result
     end
   end
 
@@ -384,6 +376,169 @@ defmodule EctoQueryParser.Builder do
         {:error, "unknown function: #{name}"}
     end
   end
+
+  defp compile_comparison_operands(op, left, right, opts) do
+    left_type = field_type(left, opts)
+    right_type = field_type(right, opts)
+
+    with {:ok, l, lj} <- resolve_operand(left, right_type, opts),
+         {:ok, r, rj} <- resolve_operand(right, left_type, opts) do
+      compile_comparison(op, l, r, lj ++ rj)
+    end
+  end
+
+  defp compile_between(target, low, high, opts) do
+    target_type = field_type(target, opts)
+
+    with {:ok, t, tj} <- to_expr(target, opts),
+         {:ok, lo_res, loj} <- resolve_operand(low, target_type, opts),
+         {:ok, hi_res, hij} <- resolve_operand(high, target_type, opts) do
+      lo = between_bound(lo_res, :low)
+      hi = between_bound(hi_res, :high)
+      {:ok, dynamic([row], ^t >= ^lo and ^t <= ^hi), tj ++ loj ++ hij}
+    end
+  end
+
+  # --- Index-friendly date comparisons ---
+
+  # `date(col) OP <date>` compares a computed value, so a plain index on
+  # `col` can't serve it and every row is converted and tested. When the
+  # other side resolves to concrete dates (a literal, a bound Date, or a
+  # literal_transform range), compare the raw column against day-start
+  # instants instead — same rows, and the index applies:
+  #
+  #   date(col) == D  →  col >= start(D) AND col < start(D + 1)
+  #   date(col) >= D  →  col >= start(D)        date(col) >  D  →  col >= start(D + 1)
+  #   date(col) <= D  →  col <  start(D + 1)    date(col) <  D  →  col <  start(D)
+  #
+  # A range {lo, hi} widens D to lo on the lower edge and hi on the upper.
+  # `start` is midnight — in the session zone, or in `zone` for
+  # `date(col, zone)` — matching what the cast computes. Anything else
+  # (another column on the right, an argument error, a date-typed column,
+  # which needs no cast) skips the rewrite and compiles as written.
+  defp date_comparison_rewrite(op, {:function, "date", _} = fun, other, opts) do
+    with {:ok, column, start} <- date_rewrite_parts(fun, opts),
+         {:ok, lo, hi} <- constant_dates(other, opts),
+         {:ok, c, joins} <- to_expr(column, opts) do
+      {:ok, date_bounds(op, c, start, lo, hi), joins}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp date_comparison_rewrite(op, other, {:function, "date", _} = fun, opts),
+    do: date_comparison_rewrite(mirror(op), fun, other, opts)
+
+  defp date_comparison_rewrite(_op, _left, _right, _opts), do: :skip
+
+  defp date_between_rewrite({:function, "date", _} = fun, low, high, opts) do
+    with {:ok, column, start} <- date_rewrite_parts(fun, opts),
+         {:ok, lo, _} <- constant_dates(low, opts),
+         {:ok, _, hi} <- constant_dates(high, opts),
+         {:ok, c, joins} <- to_expr(column, opts) do
+      from = start.(lo)
+      to = start.(Date.add(hi, 1))
+      {:ok, dynamic([row], ^c >= ^from and ^c < ^to), joins}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp date_between_rewrite(_target, _low, _high, _opts), do: :skip
+
+  defp mirror(:>=), do: :<=
+  defp mirror(:<=), do: :>=
+  defp mirror(:>), do: :<
+  defp mirror(:<), do: :>
+  defp mirror(op), do: op
+
+  defp date_bounds(:==, c, start, lo, hi) do
+    from = start.(lo)
+    to = start.(Date.add(hi, 1))
+    dynamic([row], ^c >= ^from and ^c < ^to)
+  end
+
+  defp date_bounds(:!=, c, start, lo, hi) do
+    within = date_bounds(:==, c, start, lo, hi)
+    dynamic([row], not (^within))
+  end
+
+  defp date_bounds(:>=, c, start, lo, _hi) do
+    from = start.(lo)
+    dynamic([row], ^c >= ^from)
+  end
+
+  defp date_bounds(:>, c, start, _lo, hi) do
+    from = start.(Date.add(hi, 1))
+    dynamic([row], ^c >= ^from)
+  end
+
+  defp date_bounds(:<=, c, start, _lo, hi) do
+    to = start.(Date.add(hi, 1))
+    dynamic([row], ^c < ^to)
+  end
+
+  defp date_bounds(:<, c, start, lo, _hi) do
+    to = start.(lo)
+    dynamic([row], ^c < ^to)
+  end
+
+  # The column being cast, plus a function from a Date to the instant its
+  # day starts. Declines when the column is already a date or the zone is
+  # invalid (the normal path reports that error).
+  defp date_rewrite_parts({:function, "date", [column]}, opts) do
+    if field_type(column, opts) == :date do
+      :skip
+    else
+      {:ok, column, &midnight/1}
+    end
+  end
+
+  defp date_rewrite_parts({:function, "date", [column, zone]}, opts) do
+    with false <- field_type(column, opts) == :date,
+         {:ok, tz} <- timezone_arg("date", zone) do
+      {:ok, column,
+       fn date ->
+         local = midnight(date)
+         dynamic([row], fragment("(? AT TIME ZONE ?)", ^local, constant(^tz)))
+       end}
+    else
+      _ -> :skip
+    end
+  end
+
+  defp date_rewrite_parts(_fun, _opts), do: :skip
+
+  defp midnight(%Date{} = date) do
+    naive = NaiveDateTime.new!(date, ~T[00:00:00])
+    dynamic([row], type(^naive, :naive_datetime))
+  end
+
+  # The inclusive {first, last} dates a constant operand denotes, or :skip.
+  # Strings go through literal_transform first (so natural-language ranges
+  # work), then ISO 8601.
+  defp constant_dates({:value, %Date{} = date}, _opts), do: {:ok, date, date}
+
+  defp constant_dates({:string, raw} = ast, opts) do
+    case literal_transform_result(ast, :date, opts) do
+      {:ok, %Date{} = date} ->
+        {:ok, date, date}
+
+      {:range, {%Date{} = lo, %Date{} = hi}} ->
+        {:ok, lo, hi}
+
+      :default ->
+        case Date.from_iso8601(raw) do
+          {:ok, date} -> {:ok, date, date}
+          {:error, _} -> :skip
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  defp constant_dates(_ast, _opts), do: :skip
 
   # --- Coercion and date-part functions ---
 

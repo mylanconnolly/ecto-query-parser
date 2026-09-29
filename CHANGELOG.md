@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.1
+
+### Changed
+
+- **`date(column)` comparisons against constant dates use the column's
+  index.** When `date(col)` or `date(col, zone)` is compared with a literal
+  date, a bound `Date`, or a `literal_transform` date range (including
+  `BETWEEN`), the builder compares the raw column against day-start instants
+  (midnight in the session zone, or in `zone`) instead of casting every row.
+  Results are identical; comparisons against other columns, and `date()` on a
+  column that is already a date, compile as before.
+
 ## v0.6.0
 
 ### Added
