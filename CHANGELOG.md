@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.6.0
+
+### Added
+
+- **Coercion and date-part functions**: `date(value)`, `date(datetime, zone)`,
+  `at_zone(datetime, zone)`, `text`, `integer`, `number`, `year`, `month`,
+  `day`, `weekday` (ISO, Monday = 1), `hour`, and `days_between(from, to)`.
+  Each carries a result type, so the opposite operand of a comparison is
+  cast to match (`date(created_at) == {{day}}` binds `day` as a date) and
+  projected columns report it. Zones are IANA names, validated for shape and
+  inlined with Ecto's `constant/1`, so zoned expressions group correctly;
+  plain `timestamp` columns are read in the session `TimeZone`.
+
+### Changed
+
+- Requires Ecto `~> 3.13` (for `constant/1`).
+
 ## v0.5.2
 
 ### Added

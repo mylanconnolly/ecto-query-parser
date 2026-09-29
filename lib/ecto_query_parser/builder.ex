@@ -36,6 +36,19 @@ defmodule EctoQueryParser.Builder do
     "round_year" => "year"
   }
 
+  # Coercion and date-part functions. Unlike the generic string functions
+  # these carry a result type (see `typed_function_type/1`), so the operand
+  # opposite them in a comparison is cast to that type — `date(created_at) ==
+  # {{day}}` binds the parameter as a date.
+  @typed_functions ~w(date at_zone text integer number year month day weekday hour days_between)
+
+  # IANA-shaped zone names ("UTC", "America/Chicago",
+  # "America/Argentina/Buenos_Aires"). Zones are inlined into SQL as escaped
+  # constants (see `typed_function/3`), so the shape check is defense in
+  # depth as much as a friendly error; Postgres rejects unknown names.
+  @timezone_format ~r/\A[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+){0,2}\z/
+  @max_timezone_length 64
+
   @doc """
   Builds an Ecto dynamic expression from a parsed AST.
 
@@ -311,6 +324,10 @@ defmodule EctoQueryParser.Builder do
     {:ok, dynamic([row], fragment("NOW()")), []}
   end
 
+  defp to_expr({:function, name, args}, opts) when name in @typed_functions do
+    typed_function(name, args, opts)
+  end
+
   defp to_expr({:function, name, [arg]}, opts) do
     case Map.fetch(@date_trunc_functions, name) do
       {:ok, unit} ->
@@ -365,6 +382,143 @@ defmodule EctoQueryParser.Builder do
 
       :error ->
         {:error, "unknown function: #{name}"}
+    end
+  end
+
+  # --- Coercion and date-part functions ---
+
+  # Zone conversion goes through timestamptz: a timestamptz value converts
+  # as-is, a plain timestamp is read in the session's TimeZone (run queries
+  # with TimeZone set to the zone timestamps are stored in — normally UTC).
+  # One expression then serves both column kinds, which the Ecto type alone
+  # can't tell apart (Ecto maps both datetime types to plain `timestamp`).
+  #
+  # The zone is injected with `constant/1` (an adapter-escaped literal), not
+  # bound as a parameter: a grouped SELECT expression must match its GROUP BY
+  # expression, and two separately numbered `$n` placeholders never do.
+  defp typed_function("date", [arg], opts),
+    do: with_arg(arg, opts, fn a -> dynamic([row], fragment("(?)::date", ^a)) end)
+
+  defp typed_function("date", [arg, zone], opts) do
+    with {:ok, tz} <- timezone_arg("date", zone),
+         :ok <- ensure_not_date("date", arg, opts) do
+      with_arg(arg, opts, fn a ->
+        dynamic([row], fragment("((?)::timestamptz AT TIME ZONE ?)::date", ^a, constant(^tz)))
+      end)
+    end
+  end
+
+  defp typed_function("at_zone", [arg, zone], opts) do
+    with {:ok, tz} <- timezone_arg("at_zone", zone),
+         :ok <- ensure_not_date("at_zone", arg, opts) do
+      with_arg(arg, opts, fn a ->
+        dynamic([row], fragment("((?)::timestamptz AT TIME ZONE ?)", ^a, constant(^tz)))
+      end)
+    end
+  end
+
+  defp typed_function("text", [arg], opts),
+    do: with_arg(arg, opts, fn a -> dynamic([row], fragment("(?)::text", ^a)) end)
+
+  defp typed_function("integer", [arg], opts),
+    do: with_arg(arg, opts, fn a -> dynamic([row], fragment("(?)::bigint", ^a)) end)
+
+  defp typed_function("number", [arg], opts),
+    do: with_arg(arg, opts, fn a -> dynamic([row], fragment("(?)::numeric", ^a)) end)
+
+  defp typed_function("year", [arg], opts),
+    do:
+      with_arg(arg, opts, fn a ->
+        dynamic([row], fragment("EXTRACT(YEAR FROM ?)::integer", ^a))
+      end)
+
+  defp typed_function("month", [arg], opts),
+    do:
+      with_arg(arg, opts, fn a ->
+        dynamic([row], fragment("EXTRACT(MONTH FROM ?)::integer", ^a))
+      end)
+
+  defp typed_function("day", [arg], opts),
+    do:
+      with_arg(arg, opts, fn a -> dynamic([row], fragment("EXTRACT(DAY FROM ?)::integer", ^a)) end)
+
+  # ISO numbering: 1 = Monday … 7 = Sunday.
+  defp typed_function("weekday", [arg], opts),
+    do:
+      with_arg(arg, opts, fn a ->
+        dynamic([row], fragment("EXTRACT(ISODOW FROM ?)::integer", ^a))
+      end)
+
+  defp typed_function("hour", [arg], opts),
+    do:
+      with_arg(arg, opts, fn a ->
+        dynamic([row], fragment("EXTRACT(HOUR FROM ?)::integer", ^a))
+      end)
+
+  # Whole days from `from` to `to` (positive when `to` is later), counted on
+  # calendar dates so a time of day never rounds the result.
+  defp typed_function("days_between", [from, to], opts) do
+    with {:ok, f, fj} <- cast_source(from, opts),
+         {:ok, t, tj} <- cast_source(to, opts) do
+      {:ok, dynamic([row], fragment("((?)::date - (?)::date)", ^t, ^f)), fj ++ tj}
+    end
+  end
+
+  defp typed_function(name, args, _opts) do
+    {:error, "#{name} expects #{typed_function_signature(name)}, got #{length(args)} argument(s)"}
+  end
+
+  defp typed_function_signature("date"), do: "(value) or (value, time_zone)"
+  defp typed_function_signature("at_zone"), do: "(datetime, time_zone)"
+  defp typed_function_signature("days_between"), do: "(from, to)"
+  defp typed_function_signature(_one_arg), do: "(value)"
+
+  @doc false
+  # The Ecto type a typed function produces; nil for anything else.
+  def typed_function_type("date"), do: :date
+  def typed_function_type("at_zone"), do: :naive_datetime
+  def typed_function_type("text"), do: :string
+  def typed_function_type("number"), do: :decimal
+
+  def typed_function_type(name)
+      when name in ~w(integer year month day weekday hour days_between),
+      do: :integer
+
+  def typed_function_type(_name), do: nil
+
+  defp with_arg(arg, opts, build) do
+    with {:ok, a, joins} <- cast_source(arg, opts) do
+      {:ok, build.(a), joins}
+    end
+  end
+
+  # A string literal being cast (`integer("42")`, `date("2026-01-05")`) is
+  # sent as text: left bare, Postgres would infer the parameter's type from
+  # the cast target and the driver can't encode a string as, say, a bigint.
+  defp cast_source({:string, v}, _opts), do: {:ok, dynamic([row], type(^v, :string)), []}
+  defp cast_source(arg, opts), do: to_expr(arg, opts)
+
+  defp timezone_arg(fun, {:string, tz}) do
+    if byte_size(tz) <= @max_timezone_length and Regex.match?(@timezone_format, tz) do
+      {:ok, tz}
+    else
+      {:error,
+       "#{fun}: invalid time zone #{inspect(tz)} — use an IANA name such as " <>
+         ~s("America/Chicago" or "UTC")}
+    end
+  end
+
+  defp timezone_arg(fun, _other) do
+    {:error, ~s(#{fun} takes the time zone as a string literal, e.g. "America/Chicago")}
+  end
+
+  # A date has no time of day: converting it to a zone would shift it to the
+  # previous or next day, never what the query meant.
+  defp ensure_not_date(fun, arg, opts) do
+    if field_type(arg, opts) == :date do
+      {:error, "#{fun} converts datetimes between time zones; the value is already a date"}
+    else
+      :ok
     end
   end
 
@@ -910,6 +1064,9 @@ defmodule EctoQueryParser.Builder do
       simple_field_type(name, opts)
     end
   end
+
+  defp field_type({:function, name, _args}, _opts) when name in @typed_functions,
+    do: typed_function_type(name)
 
   defp field_type(_, _), do: nil
 

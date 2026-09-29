@@ -1,7 +1,7 @@
 defmodule EctoQueryParser.MixProject do
   use Mix.Project
 
-  @version "0.5.2"
+  @version "0.6.0"
   @source_url "https://github.com/mylanconnolly/ecto_query_parser"
 
   def project do
@@ -60,7 +60,7 @@ defmodule EctoQueryParser.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ecto, "~> 3.0"},
+      {:ecto, "~> 3.13"},
       {:phrase_utils, "~> 0.1"},
       {:usage_rules, "~> 1.1", only: [:dev]},
       {:igniter, "~> 0.6", only: [:dev]},
