@@ -273,3 +273,4 @@ Postgres remains the only target (fragments: `ILIKE`, `DATE_TRUNC`,
 | 2026-07-28 | Resolver contract: `fn slug -> {:ok, queryable, fields} \| {:error, message}` — queryable and field spec returned together |
 | 2026-07-28 | Projection output columns are positional atoms `:c0..:c63` (max 64/stage) with a name→key rename map returned to the caller; input-derived aliases never become atoms |
 | 2026-09-28 | Output columns carry `field` provenance (source path for plain projections/breakouts, carried through re-projections, nil when computed) so callers can map results back to catalog entries |
+| 2026-09-29 | Coercion/date-part functions are typed; time zones are explicit IANA string literals inlined via `constant/1` (bound `$n` placeholders break GROUP BY), and zone conversion goes through `timestamptz` so one expression serves `timestamp` and `timestamptz` columns |

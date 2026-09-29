@@ -806,4 +806,57 @@ defmodule EctoQueryParser.PipeTest do
       assert {:error, %ParseError{}} = build("orders | flter x")
     end
   end
+
+  # --- Coercion and date-part functions ---
+
+  describe "typed functions" do
+    test "a date parameter opposite date() binds as a date" do
+      out = sql("orders | filter date(created_at) == {{day}}", params: %{"day" => ~D[2026-01-05]})
+      assert out =~ ~s|fragment("(?)::date", o0.created_at) == type(^~D[2026-01-05], :date)|
+    end
+
+    test "zones are inlined as constants, not bound parameters" do
+      out = sql(~s[orders | filter date(created_at, "America/Chicago") == "2026-01-05"])
+      assert out =~ ~s|AT TIME ZONE ?)::date", o0.created_at, "America/Chicago")|
+    end
+
+    test "select and group columns carry the function's result type" do
+      assert {:ok, _query, columns} =
+               build(
+                 ~s[orders | group day = date(created_at, "UTC") { n = count() } | filter day >= "2026-01-01"]
+               )
+
+      assert [%{name: "day"}, %{name: "n"}] = columns
+    end
+
+    test "invalid zones are positioned validation errors" do
+      assert {:error, %ValidationError{message: message}} =
+               build(~s[orders | select d = date(created_at, "America/Chicago'; drop table x")])
+
+      assert message =~ "invalid time zone"
+
+      assert {:error, %ValidationError{message: message}} =
+               build("orders | select d = at_zone(created_at, name)")
+
+      assert message =~ "string literal"
+    end
+
+    test "a date can't be moved between zones" do
+      assert {:error, %ValidationError{message: message}} =
+               build(~s[orders | select d = at_zone(performed_on, "UTC")])
+
+      assert message =~ "already a date"
+    end
+
+    test "wrong arity names the expected arguments" do
+      assert {:error, %ValidationError{message: message}} =
+               build("orders | select d = days_between(created_at)")
+
+      assert message =~ "days_between expects (from, to), got 1 argument(s)"
+
+      # Filter-stage errors are plain messages, prefixed with the stage.
+      assert {:error, message} = build("orders | filter at_zone(created_at) == 1")
+      assert message =~ "at_zone expects (datetime, time_zone)"
+    end
+  end
 end

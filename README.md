@@ -194,6 +194,30 @@ Functions are case-insensitive and can be nested.
 The `ROUND_*` family includes: `ROUND_SECOND`, `ROUND_MINUTE`, `ROUND_HOUR`,
 `ROUND_DAY`, `ROUND_WEEK`, `ROUND_MONTH`, `ROUND_QUARTER`, `ROUND_YEAR`.
 
+**Coercion and date-part functions** carry a result type, so the value on the
+other side of a comparison is cast to match (`DATE(created_at) == {{day}}`
+binds `day` as a date):
+
+| Function | Result | Example |
+|----------|--------|---------|
+| `DATE(value)` | date | `DATE(created_at) == "2026-01-05"` |
+| `DATE(datetime, zone)` | date | `DATE(created_at, "America/Chicago") == {{day}}` |
+| `AT_ZONE(datetime, zone)` | naive datetime | `ROUND_DAY(AT_ZONE(created_at, "America/Chicago"))` |
+| `TEXT(value)` | string | `TEXT(id) == "42"` |
+| `INTEGER(value)` | integer | `INTEGER(code) > 10` |
+| `NUMBER(value)` | decimal | `NUMBER(amount_text) >= 100` |
+| `YEAR`, `MONTH`, `DAY`, `HOUR(datetime)` | integer | `HOUR(created_at) >= 17` |
+| `WEEKDAY(datetime)` | integer, ISO (Monday = 1) | `WEEKDAY(created_at) IN [6, 7]` |
+| `DAYS_BETWEEN(from, to)` | integer | `DAYS_BETWEEN(created_at, performed_on) > 7` |
+
+Time zones are IANA names given as string literals. Zone conversion reads
+plain `timestamp` columns in the session's `TimeZone` (set it to the zone the
+data is stored in, normally `UTC`); `timestamptz` columns convert as-is. The
+zone is inlined as an escaped SQL constant rather than bound as a parameter,
+so zoned expressions work as `group` breakouts. A cast fails the whole query
+if any row can't convert (`INTEGER("abc")`), and `DATE(...)` on a column
+doesn't use that column's index.
+
 ## Pipe language
 
 Beyond single filter strings, the package parses a staged **pipe language** —

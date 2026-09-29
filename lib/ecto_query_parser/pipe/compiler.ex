@@ -549,12 +549,13 @@ defmodule EctoQueryParser.Pipe.Compiler do
   defp function_ast(literal, _ctx), do: literal
 
   # Temporal bucketing keeps the argument's type (DATE_TRUNC preserves it for
-  # coercion purposes); other functions produce an unknown type.
+  # coercion purposes); coercion and date-part functions have a fixed result
+  # type; other functions produce an unknown type.
   defp function_type({:pfunc, fname, _pos, [first | _]}, ctx) when fname in @round_functions do
     argument_type(first, ctx)
   end
 
-  defp function_type(_func, _ctx), do: nil
+  defp function_type({:pfunc, fname, _pos, _args}, _ctx), do: Builder.typed_function_type(fname)
 
   defp argument_type({:pcol, name, _pos}, %{mode: :base} = ctx),
     do: Builder.type_of({:identifier, name}, base_builder_opts(ctx))
