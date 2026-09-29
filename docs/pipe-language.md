@@ -272,3 +272,4 @@ Postgres remains the only target (fragments: `ILIKE`, `DATE_TRUNC`,
 | 2026-07-28 | Pipe language ships in v0.5.0 alongside parameters (0.5.0 unpublished; avoid two same-day releases) |
 | 2026-07-28 | Resolver contract: `fn slug -> {:ok, queryable, fields} \| {:error, message}` — queryable and field spec returned together |
 | 2026-07-28 | Projection output columns are positional atoms `:c0..:c63` (max 64/stage) with a name→key rename map returned to the caller; input-derived aliases never become atoms |
+| 2026-09-28 | Output columns carry `field` provenance (source path for plain projections/breakouts, carried through re-projections, nil when computed) so callers can map results back to catalog entries |

@@ -337,8 +337,48 @@ defmodule EctoQueryParser.PipeTest do
 
     test "select projects into positional keys and returns the column mapping" do
       assert {:ok, query, columns} = build("orders | select name, age")
-      assert columns == [%{name: "name", key: :c0}, %{name: "age", key: :c1}]
+
+      assert columns == [
+               %{name: "name", key: :c0, field: ["name"]},
+               %{name: "age", key: :c1, field: ["age"]}
+             ]
+
       assert inspect(query) =~ "select: %{c0: o0.name, c1: o0.age}"
+    end
+
+    test "columns carry their source path as field, nil when computed" do
+      allowed =
+        @allowed ++
+          [
+            author:
+              {:belongs_to,
+               table: "authors", owner_key: :author_id, related_key: :id, fields: [name: :string]}
+          ]
+
+      assert {:ok, _query, columns} =
+               build("orders | select author.name, name, month = round_month(created_at)",
+                 allowed_fields: allowed
+               )
+
+      assert [
+               %{name: "author.name", field: ["author", "name"]},
+               %{name: "name", field: ["name"]},
+               %{name: "month", field: nil}
+             ] = columns
+    end
+
+    test "field carries through stages that re-project a column by name" do
+      assert {:ok, _query, columns} =
+               build(
+                 "orders | group region, status { total = sum(amount) } " <>
+                   "| select status, total, region"
+               )
+
+      assert [
+               %{name: "status", field: ["status"]},
+               %{name: "total", field: nil},
+               %{name: "region", field: ["region"]}
+             ] = columns
     end
 
     test "consecutive filters merge into one query level" do
@@ -426,7 +466,7 @@ defmodule EctoQueryParser.PipeTest do
       assert {:ok, query, columns} =
                build("orders | group region { total = sum(amount), n = count() } | select total")
 
-      assert columns == [%{name: "total", key: :c0}]
+      assert columns == [%{name: "total", key: :c0, field: nil}]
       assert inspect(query) =~ "select: %{c0: o0.c1}"
     end
 
@@ -470,10 +510,10 @@ defmodule EctoQueryParser.PipeTest do
                build("orders | group region, status { total = sum(amount), n = count() }")
 
       assert columns == [
-               %{name: "region", key: :c0},
-               %{name: "status", key: :c1},
-               %{name: "total", key: :c2},
-               %{name: "n", key: :c3}
+               %{name: "region", key: :c0, field: ["region"]},
+               %{name: "status", key: :c1, field: ["status"]},
+               %{name: "total", key: :c2, field: nil},
+               %{name: "n", key: :c3, field: nil}
              ]
 
       out = inspect(query)
@@ -698,7 +738,7 @@ defmodule EctoQueryParser.PipeTest do
                  resolve_source: resolver()
                )
 
-      assert columns == [%{name: "grand_total", key: :c0}]
+      assert columns == [%{name: "grand_total", key: :c0, field: nil}]
     end
 
     test "a @slug without a resolver is a positioned build error" do
@@ -750,7 +790,7 @@ defmodule EctoQueryParser.PipeTest do
       aggs = Enum.map_join(1..64, ", ", fn i -> "a#{i} = count()" end)
       assert {:ok, _query, columns} = build("orders | group { #{aggs} }")
       assert length(columns) == 64
-      assert List.last(columns) == %{name: "a64", key: :c63}
+      assert List.last(columns) == %{name: "a64", key: :c63, field: nil}
     end
   end
 
