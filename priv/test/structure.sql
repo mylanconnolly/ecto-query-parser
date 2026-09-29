@@ -46,3 +46,4 @@ CREATE TABLE post_tags (
 );
 
 CREATE INDEX ON post_tags(tag_id);
+CREATE INDEX test_items_created_at_index ON test_items(created_at);

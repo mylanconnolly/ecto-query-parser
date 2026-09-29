@@ -810,13 +810,13 @@ defmodule EctoQueryParser.PipeTest do
   # --- Coercion and date-part functions ---
 
   describe "typed functions" do
-    test "a date parameter opposite date() binds as a date" do
-      out = sql("orders | filter date(created_at) == {{day}}", params: %{"day" => ~D[2026-01-05]})
-      assert out =~ ~s|fragment("(?)::date", o0.created_at) == type(^~D[2026-01-05], :date)|
+    test "a column opposite date() is compared as a date" do
+      out = sql("orders | filter date(created_at) == performed_on")
+      assert out =~ ~s|fragment("(?)::date", o0.created_at) == o0.performed_on|
     end
 
     test "zones are inlined as constants, not bound parameters" do
-      out = sql(~s[orders | filter date(created_at, "America/Chicago") == "2026-01-05"])
+      out = sql(~s[orders | select d = date(created_at, "America/Chicago")])
       assert out =~ ~s|AT TIME ZONE ?)::date", o0.created_at, "America/Chicago")|
     end
 
@@ -857,6 +857,62 @@ defmodule EctoQueryParser.PipeTest do
       # Filter-stage errors are plain messages, prefixed with the stage.
       assert {:error, message} = build("orders | filter at_zone(created_at) == 1")
       assert message =~ "at_zone expects (datetime, time_zone)"
+    end
+  end
+
+  describe "date() compared to constant dates" do
+    # The raw column is compared against day-start instants, so an index on
+    # it applies; see the integration tests for plans and result parity.
+
+    test "a date parameter becomes a day range" do
+      out = sql("orders | filter date(created_at) == {{day}}", params: %{"day" => ~D[2026-01-05]})
+
+      assert out =~ "o0.created_at >= type(^~N[2026-01-05 00:00:00], :naive_datetime)"
+      assert out =~ "o0.created_at < type(^~N[2026-01-06 00:00:00], :naive_datetime)"
+      refute out =~ "::date"
+    end
+
+    test "each operator picks its edge, mirrored when the date is on the left" do
+      assert sql(~s[orders | filter date(created_at) > "2026-01-05"]) =~
+               "o0.created_at >= type(^~N[2026-01-06 00:00:00]"
+
+      assert sql(~s[orders | filter date(created_at) < "2026-01-05"]) =~
+               "o0.created_at < type(^~N[2026-01-05 00:00:00]"
+
+      assert sql(~s[orders | filter date(created_at) <= "2026-01-05"]) =~
+               "o0.created_at < type(^~N[2026-01-06 00:00:00]"
+
+      assert sql(~s[orders | filter "2026-01-05" <= date(created_at)]) =~
+               "o0.created_at >= type(^~N[2026-01-05 00:00:00]"
+
+      assert sql(~s[orders | filter date(created_at) != "2026-01-05"]) =~ "not (o0.created_at >="
+    end
+
+    test "a zone moves the day boundaries into that zone" do
+      out = sql(~s[orders | filter date(created_at, "America/Chicago") == "2026-01-05"])
+      assert out =~ ~s|"(? AT TIME ZONE ?)",|
+      assert out =~ "type(^~N[2026-01-05 00:00:00], :naive_datetime),"
+      assert out =~ ~s|"America/Chicago"|
+    end
+
+    test "transform ranges and BETWEEN widen to their first and last day" do
+      transform = fn
+        :date, "last week" -> {:range, {~D[2026-01-05], ~D[2026-01-11]}}
+        _type, _raw -> :default
+      end
+
+      out = sql(~s[orders | filter date(created_at) == "last week"], literal_transform: transform)
+      assert out =~ "o0.created_at >= type(^~N[2026-01-05 00:00:00]"
+      assert out =~ "o0.created_at < type(^~N[2026-01-12 00:00:00]"
+
+      out = sql(~s[orders | filter date(created_at) BETWEEN "2026-01-01" AND "2026-01-31"])
+      assert out =~ "o0.created_at >= type(^~N[2026-01-01 00:00:00]"
+      assert out =~ "o0.created_at < type(^~N[2026-02-01 00:00:00]"
+    end
+
+    test "a column that is already a date keeps the cast form" do
+      assert sql(~s[orders | filter date(performed_on) == "2026-01-05"]) =~
+               ~s|fragment("(?)::date", o0.performed_on)|
     end
   end
 end
