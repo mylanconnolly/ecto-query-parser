@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.2
+
+### Added
+
+- **Output columns report their provenance.** Each entry `build_pipe/2`
+  returns in `columns` now carries `field`: the source path a plain
+  projection or breakout reads (`["customer", "region"]` for
+  `customer.region`), carried through later stages that re-project it by
+  name, and `nil` for anything computed (functions, aggregations). Callers
+  can map an output column back to its catalog entry — types, labels,
+  descriptions — without re-parsing the query.
+
 ## v0.5.1
 
 ### Fixed
