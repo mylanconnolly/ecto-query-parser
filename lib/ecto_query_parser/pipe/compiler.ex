@@ -75,7 +75,11 @@ defmodule EctoQueryParser.Pipe.Compiler do
       end)
       |> case do
         {:ok, %{mode: :derived} = ctx} ->
-          {:ok, ctx.query, Enum.map(ctx.cols, &%{name: &1.name, key: &1.key, field: &1.field})}
+          {:ok, ctx.query,
+           Enum.map(
+             ctx.cols,
+             &%{name: &1.name, key: &1.key, field: &1.field, derived_from: &1.derived_from}
+           )}
 
         {:ok, ctx} ->
           {:ok, ctx.query, nil}
@@ -351,13 +355,31 @@ defmodule EctoQueryParser.Pipe.Compiler do
 
   defp build_column({:pcol, name, pos}, stage, index, ctx) do
     with {:ok, dyn, joins, type} <- resolve_column(name, pos, stage, index, ctx) do
-      {:ok, %{name: name, type: type, field: column_field(name, ctx), dyn: dyn, pos: pos}, joins}
+      col = %{
+        name: name,
+        type: type,
+        field: column_field(name, ctx),
+        derived_from: column_derived_from(name, ctx),
+        dyn: dyn,
+        pos: pos
+      }
+
+      {:ok, col, joins}
     end
   end
 
   defp build_column({:aliased, alias_name, alias_pos, func}, stage, index, ctx) do
     with {:ok, dyn, joins, type} <- resolve_function(func, stage, index, ctx) do
-      {:ok, %{name: alias_name, type: type, field: nil, dyn: dyn, pos: alias_pos}, joins}
+      col = %{
+        name: alias_name,
+        type: type,
+        field: nil,
+        derived_from: function_derivation(func, ctx),
+        dyn: dyn,
+        pos: alias_pos
+      }
+
+      {:ok, col, joins}
     end
   end
 
@@ -370,7 +392,16 @@ defmodule EctoQueryParser.Pipe.Compiler do
         [fname | for({:pcol, arg_name, _} <- args, do: String.replace(arg_name, ".", "_"))]
         |> Enum.join("_")
 
-      {:ok, %{name: name, type: type, field: nil, dyn: dyn, pos: pos}, joins}
+      col = %{
+        name: name,
+        type: type,
+        field: nil,
+        derived_from: function_derivation(func, ctx),
+        dyn: dyn,
+        pos: pos
+      }
+
+      {:ok, col, joins}
     end
   end
 
@@ -380,6 +411,33 @@ defmodule EctoQueryParser.Pipe.Compiler do
   # column is known to exist — resolve_column just succeeded).
   defp column_field(name, %{mode: :base}), do: String.split(name, ".")
   defp column_field(name, %{mode: :derived} = ctx), do: find_column(ctx.cols, name).field
+
+  # A computed column's provenance: the outermost function or aggregation
+  # and every source path it reads, however deeply nested, including through
+  # earlier stages (a re-projected computed column keeps its derivation).
+  # Plain projections have none at the base level.
+  defp column_derived_from(_name, %{mode: :base}), do: nil
+
+  defp column_derived_from(name, %{mode: :derived} = ctx),
+    do: find_column(ctx.cols, name).derived_from
+
+  defp function_derivation({:pfunc, fname, _pos, args}, ctx),
+    do: %{function: fname, fields: args |> Enum.flat_map(&leaf_fields(&1, ctx)) |> Enum.uniq()}
+
+  defp leaf_fields({:pcol, name, _pos}, %{mode: :base}), do: [String.split(name, ".")]
+
+  defp leaf_fields({:pcol, name, _pos}, %{mode: :derived} = ctx) do
+    case find_column(ctx.cols, name) do
+      %{field: field} when is_list(field) -> [field]
+      %{derived_from: %{fields: fields}} -> fields
+      _ -> []
+    end
+  end
+
+  defp leaf_fields({:pfunc, _fname, _pos, args}, ctx),
+    do: Enum.flat_map(args, &leaf_fields(&1, ctx))
+
+  defp leaf_fields(_literal, _ctx), do: []
 
   # --- Aggregations ---
 
@@ -401,6 +459,7 @@ defmodule EctoQueryParser.Pipe.Compiler do
       name: alias_name,
       type: :integer,
       field: nil,
+      derived_from: %{function: "count", fields: []},
       dyn: dynamic([row], count()),
       pos: alias_pos
     }
@@ -414,6 +473,7 @@ defmodule EctoQueryParser.Pipe.Compiler do
         name: alias_name,
         type: agg_type(fun, arg_type),
         field: nil,
+        derived_from: %{function: fun, fields: leaf_fields({:pcol, name, pos}, ctx)},
         dyn: agg_dynamic(fun, arg_dyn),
         pos: alias_pos
       }
