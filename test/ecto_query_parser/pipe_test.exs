@@ -339,8 +339,8 @@ defmodule EctoQueryParser.PipeTest do
       assert {:ok, query, columns} = build("orders | select name, age")
 
       assert columns == [
-               %{name: "name", key: :c0, field: ["name"]},
-               %{name: "age", key: :c1, field: ["age"]}
+               %{name: "name", key: :c0, field: ["name"], derived_from: nil},
+               %{name: "age", key: :c1, field: ["age"], derived_from: nil}
              ]
 
       assert inspect(query) =~ "select: %{c0: o0.name, c1: o0.age}"
@@ -364,6 +364,57 @@ defmodule EctoQueryParser.PipeTest do
                %{name: "author.name", field: ["author", "name"]},
                %{name: "name", field: ["name"]},
                %{name: "month", field: nil}
+             ] = columns
+    end
+
+    test "computed columns carry derived_from: the outer function and every path it reads" do
+      allowed =
+        @allowed ++
+          [
+            author:
+              {:belongs_to,
+               table: "authors", owner_key: :author_id, related_key: :id, fields: [name: :string]}
+          ]
+
+      assert {:ok, _query, columns} =
+               build(
+                 "orders | group month = round_month(created_at) " <>
+                   "{ n = count(), people = count_distinct(author.name), latest = max(created_at) }",
+                 allowed_fields: allowed
+               )
+
+      assert [
+               %{
+                 name: "month",
+                 field: nil,
+                 derived_from: %{function: "round_month", fields: [["created_at"]]}
+               },
+               %{name: "n", derived_from: %{function: "count", fields: []}},
+               %{
+                 name: "people",
+                 derived_from: %{function: "count_distinct", fields: [["author", "name"]]}
+               },
+               %{name: "latest", derived_from: %{function: "max", fields: [["created_at"]]}}
+             ] = columns
+    end
+
+    test "nested functions list their leaf paths; literals add none" do
+      assert {:ok, _query, [col]} =
+               build(~s[orders | select label = coalesce(text(name), "none")])
+
+      assert col.derived_from == %{function: "coalesce", fields: [["name"]]}
+    end
+
+    test "derivation carries through later stages" do
+      assert {:ok, _query, columns} =
+               build(
+                 "orders | group day = date(created_at) { n = count() } " <>
+                   "| select day, n | group { busiest = max(n), last_day = max(day) }"
+               )
+
+      assert [
+               %{name: "busiest", derived_from: %{function: "max", fields: []}},
+               %{name: "last_day", derived_from: %{function: "max", fields: [["created_at"]]}}
              ] = columns
     end
 
@@ -466,7 +517,15 @@ defmodule EctoQueryParser.PipeTest do
       assert {:ok, query, columns} =
                build("orders | group region { total = sum(amount), n = count() } | select total")
 
-      assert columns == [%{name: "total", key: :c0, field: nil}]
+      assert columns == [
+               %{
+                 name: "total",
+                 key: :c0,
+                 field: nil,
+                 derived_from: %{function: "sum", fields: [["amount"]]}
+               }
+             ]
+
       assert inspect(query) =~ "select: %{c0: o0.c1}"
     end
 
@@ -510,10 +569,15 @@ defmodule EctoQueryParser.PipeTest do
                build("orders | group region, status { total = sum(amount), n = count() }")
 
       assert columns == [
-               %{name: "region", key: :c0, field: ["region"]},
-               %{name: "status", key: :c1, field: ["status"]},
-               %{name: "total", key: :c2, field: nil},
-               %{name: "n", key: :c3, field: nil}
+               %{name: "region", key: :c0, field: ["region"], derived_from: nil},
+               %{name: "status", key: :c1, field: ["status"], derived_from: nil},
+               %{
+                 name: "total",
+                 key: :c2,
+                 field: nil,
+                 derived_from: %{function: "sum", fields: [["amount"]]}
+               },
+               %{name: "n", key: :c3, field: nil, derived_from: %{function: "count", fields: []}}
              ]
 
       out = inspect(query)
@@ -738,7 +802,8 @@ defmodule EctoQueryParser.PipeTest do
                  resolve_source: resolver()
                )
 
-      assert columns == [%{name: "grand_total", key: :c0, field: nil}]
+      assert [%{name: "grand_total", key: :c0, field: nil, derived_from: %{function: "sum"}}] =
+               columns
     end
 
     test "a @slug without a resolver is a positioned build error" do
@@ -790,7 +855,13 @@ defmodule EctoQueryParser.PipeTest do
       aggs = Enum.map_join(1..64, ", ", fn i -> "a#{i} = count()" end)
       assert {:ok, _query, columns} = build("orders | group { #{aggs} }")
       assert length(columns) == 64
-      assert List.last(columns) == %{name: "a64", key: :c63, field: nil}
+
+      assert List.last(columns) == %{
+               name: "a64",
+               key: :c63,
+               field: nil,
+               derived_from: %{function: "count", fields: []}
+             }
     end
   end
 

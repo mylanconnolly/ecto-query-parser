@@ -210,8 +210,9 @@ defmodule EctoQueryParser do
 
       columns
       #=> [
-      #=>   %{name: "region", key: :c0, field: ["region"]},
-      #=>   %{name: "total", key: :c1, field: nil}
+      #=>   %{name: "region", key: :c0, field: ["region"], derived_from: nil},
+      #=>   %{name: "total", key: :c1, field: nil,
+      #=>     derived_from: %{function: "sum", fields: [["amount"]]}}
       #=> ]
 
       Repo.all(query)
@@ -224,6 +225,16 @@ defmodule EctoQueryParser do
   name, and `nil` for anything computed — functions and aggregations. It
   lets a caller map an output column back to its catalog entry (types,
   labels, descriptions) without re-parsing the query.
+
+  A computed column's `derived_from` says what it was computed from:
+  `%{function: name, fields: paths}` — the outermost function or
+  aggregation (`"sum"`, `"count"`, `"round_month"`) and every source path
+  it reads, however deeply nested and through earlier stages (a
+  re-projected computed column keeps its derivation; a plain re-projection
+  of a source column keeps `field` instead). `count()` reads no paths.
+  Plain projections have `derived_from: nil`. It lets a caller decide
+  column by column what a computed value can reveal — a count of rows
+  versus the latest value of some column.
   When the pipe has no projection stage (bare source, or filter/sort/limit
   only), the query keeps the source's own row shape and `columns` is `nil` —
   note that a schemaless table source then has no select clause at all, so

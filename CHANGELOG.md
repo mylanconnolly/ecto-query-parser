@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.7.0
+
+### Added
+
+- **`derived_from` on projected columns.** Each column returned by
+  `build_pipe/2` now also carries `derived_from`: `nil` for plain
+  projections, and for computed columns `%{function: name, fields: paths}`
+  — the outermost function or aggregation and every source path it reads,
+  followed through nested functions and earlier stages. `count()` reads no
+  paths. Callers that previously matched the column maps exactly need to
+  account for the new key.
+
 ## v0.6.1
 
 ### Changed
